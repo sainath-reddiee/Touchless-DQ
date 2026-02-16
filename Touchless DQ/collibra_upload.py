@@ -147,26 +147,7 @@ with st.sidebar:
     else:
         if st.button("⚡ Test Connection", use_container_width=True):
             try:
-                # Apply context changes via USE commands
-                ctx_cmds = []
-                if st.session_state.get("sf_role"):
-                    ctx_cmds.append(f'USE ROLE "{st.session_state.sf_role}"')
-                if st.session_state.get("sf_warehouse"):
-                    ctx_cmds.append(f'USE WAREHOUSE "{st.session_state.sf_warehouse}"')
-                if st.session_state.get("sf_database"):
-                    ctx_cmds.append(f'USE DATABASE "{st.session_state.sf_database}"')
-                if st.session_state.get("sf_schema"):
-                    ctx_cmds.append(f'USE SCHEMA "{st.session_state.sf_database}"."{st.session_state.sf_schema}"')
-
-                for cmd in ctx_cmds:
-                    if session is not None:
-                        session.sql(cmd).collect()
-                    elif st.session_state.get("connection"):
-                        cur = st.session_state.connection.cursor()
-                        cur.execute(cmd)
-                        cur.close()
-
-                # Validate with SELECT 1
+                # Simple validation query - sidebar values are informational only
                 if session is not None:
                     session.sql("SELECT 1").collect()
                 elif st.session_state.get("connection"):
@@ -456,15 +437,17 @@ def load_table(table_name):
 # ---------------------------------------------------------------------------
 import tempfile, os
 
-def _read_stage_file(fq_stage, file_name):
-    """Download a file from a fully-qualified Snowflake stage and read as DataFrame.
-    fq_stage: e.g. "DB"."SCHEMA"."STAGE_NAME"
-    file_name: e.g. my_catalog.xlsx
-    """
+def _read_stage_file(ctx_db, ctx_schema, stage_name, file_path):
+    """Download a file from a Snowflake stage and read it as a DataFrame."""
     tmp_dir = tempfile.mkdtemp()
 
     try:
-        get_query = f'GET @{fq_stage}/{file_name} file://{tmp_dir}/'
+        # Build fully-qualified stage reference
+        # file_path from LIST looks like: db.schema.stage_name/filename.xlsx
+        # Extract just the filename
+        file_name = file_path.split("/")[-1]
+
+        get_query = f"GET '@{ctx_db}.{ctx_schema}.{stage_name}/{file_name}' 'file://{tmp_dir}/'"
 
         conn = st.session_state.get("connection")
         if conn:
@@ -506,45 +489,80 @@ def _read_stage_file(fq_stage, file_name):
 
 
 def stage_file_picker(prefix, file_types=None):
-    """Render text-input-based Stage file picker.
-    Returns (fully_qualified_stage, file_name) or (None, None).
-    Stage DB/Schema default to sidebar context but can be overridden.
+    """Render Stage → File dropdown picker using sidebar DB/Schema context.
+    Returns (stage_name, file_path) or (None, None).
     """
-    col_db, col_schema = st.columns(2)
-    with col_db:
-        stage_db = st.text_input(
-            "Stage Database",
-            value=st.session_state.get(f"{prefix}_stage_db",
-                  st.session_state.get("sf_database", "")),
-            key=f"{prefix}_stage_db",
-            placeholder="MY_DATABASE"
-        )
-    with col_schema:
-        stage_schema = st.text_input(
-            "Stage Schema",
-            value=st.session_state.get(f"{prefix}_stage_schema",
-                  st.session_state.get("sf_schema", "")),
-            key=f"{prefix}_stage_schema",
-            placeholder="PUBLIC"
-        )
+    ctx_db = st.session_state.get("sf_database", "")
+    ctx_schema = st.session_state.get("sf_schema", "")
 
-    col_stage, col_file = st.columns(2)
+    if not ctx_db or not ctx_schema:
+        st.warning("⚠️ Set **Database** and **Source Schema** in the sidebar first")
+        return None, None
+
+    st.caption(f'📌 Stage Context: `{ctx_db}.{ctx_schema}` (from sidebar)')
+
+    # Fetch stages in sidebar context
+    stages = get_cached_list(
+        f"_sf_stages_{ctx_db}_{ctx_schema}",
+        f'SHOW STAGES IN SCHEMA "{ctx_db}"."{ctx_schema}"',
+        "name"
+    )
+
+    col_stage, col_file, col_refresh = st.columns([4, 5, 1])
+
     with col_stage:
-        stage_name = st.text_input(
-            "Stage Name",
-            key=f"{prefix}_stage_name",
-            placeholder="MY_STAGE"
-        )
-    with col_file:
-        file_name = st.text_input(
-            "File Name",
-            key=f"{prefix}_file_name",
-            placeholder="dq_catalog.xlsx"
+        selected_stage = st.selectbox(
+            "Stage",
+            [""] + stages, key=f"{prefix}_stage",
+            format_func=lambda x: x if x else "Select stage..."
         )
 
-    if stage_db and stage_schema and stage_name and file_name:
-        fq_stage = f'"{stage_db}"."{stage_schema}"."{stage_name}"'
-        return fq_stage, file_name
+    # Fetch files when a stage is selected
+    files = []
+    if selected_stage:
+        fq_stage = f"{ctx_db}.{ctx_schema}.{selected_stage}"
+        files_cache_key = f"_sf_stage_files_{fq_stage}"
+        if files_cache_key not in st.session_state:
+            try:
+                query = f"LIST '@{fq_stage}'"
+                df = run_query_df(query)
+                if "name" in df.columns:
+                    st.session_state[files_cache_key] = df["name"].dropna().tolist()
+                elif len(df.columns) > 0:
+                    st.session_state[files_cache_key] = df.iloc[:, 0].dropna().tolist()
+                else:
+                    st.session_state[files_cache_key] = []
+            except Exception:
+                st.session_state[files_cache_key] = []
+        files = st.session_state[files_cache_key]
+
+        # Filter by file type if specified
+        if file_types and files:
+            files = [f for f in files
+                     if any(f.lower().endswith(ext) for ext in file_types)]
+
+    with col_file:
+        # Show just filenames for readability
+        display_files = [f.split("/")[-1] for f in files]
+        file_map = dict(zip(display_files, files))
+
+        selected_display = st.selectbox(
+            "File",
+            [""] + display_files, key=f"{prefix}_stage_file",
+            format_func=lambda x: x if x else "Select file..."
+        )
+
+    with col_refresh:
+        st.write("")  # spacer
+        st.write("")
+        if st.button("🔄", key=f"{prefix}_stage_refresh", help="Refresh stage/file lists"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("_sf_stage"):
+                    del st.session_state[k]
+            st.experimental_rerun()
+
+    if selected_stage and selected_display:
+        return selected_stage, file_map.get(selected_display, selected_display)
     return None, None
 
 
@@ -569,15 +587,17 @@ cat_stage, cat_file = stage_file_picker(
 if st.button("📥 Load Catalog", key="load_catalog_stage_btn", type="primary"):
     if cat_stage and cat_file:
         try:
-            with st.spinner(f"Loading from @{cat_stage}..."):
-                catalog_df = _read_stage_file(cat_stage, cat_file)
+            ctx_db = st.session_state.get("sf_database", "")
+            ctx_schema = st.session_state.get("sf_schema", "")
+            with st.spinner(f"Loading from @{ctx_db}.{ctx_schema}.{cat_stage}..."):
+                catalog_df = _read_stage_file(ctx_db, ctx_schema, cat_stage, cat_file)
                 if catalog_df is not None:
                     st.session_state.catalog_df = catalog_df
                     st.success(f"✅ Catalog loaded: **{len(catalog_df)}** checks")
         except Exception as e:
             st.error(f"Failed to load file: {e}")
     else:
-        st.warning("Please fill in Stage Database, Schema, Stage Name, and File Name")
+        st.warning("Please select a stage and file from the dropdowns")
 
 if st.session_state.catalog_df is not None:
     with st.expander(f"📋 View Catalog ({len(st.session_state.catalog_df)} rows)", expanded=False):
@@ -623,15 +643,17 @@ else:
     if st.button("📥 Load from Stage", key="load_metadata_stage_btn", type="primary"):
         if meta_stage and meta_file:
             try:
-                with st.spinner(f"Loading from @{meta_stage}..."):
-                    metadata_df = _read_stage_file(meta_stage, meta_file)
+                ctx_db = st.session_state.get("sf_database", "")
+                ctx_schema = st.session_state.get("sf_schema", "")
+                with st.spinner(f"Loading from @{ctx_db}.{ctx_schema}.{meta_stage}..."):
+                    metadata_df = _read_stage_file(ctx_db, ctx_schema, meta_stage, meta_file)
                     if metadata_df is not None:
                         st.session_state.collibra_metadata = metadata_df
                         st.success(f"✅ Metadata loaded: **{len(metadata_df)}** columns")
             except Exception as e:
                 st.error(f"Failed to load file: {e}")
         else:
-            st.warning("Please fill in Stage Database, Schema, Stage Name, and File Name")
+            st.warning("Please select a stage and file from the dropdowns")
 
 # Use whatever is in session state
 if st.session_state.collibra_metadata is not None:
