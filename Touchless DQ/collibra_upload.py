@@ -157,7 +157,7 @@ with st.sidebar:
                             # Clear cached context lists so they get re-fetched
                             for k in ["_roles", "_warehouses", "_databases"]:
                                 st.session_state.pop(k, None)
-                            st.rerun()
+                            st.experimental_rerun()
                     except Exception as e:
                         st.error(f"Connection failed: {e}")
 
@@ -187,7 +187,7 @@ with st.sidebar:
                 # Clear downstream caches when role changes
                 for k in ["_warehouses", "_databases"]:
                     st.session_state.pop(k, None)
-                st.rerun()
+                st.experimental_rerun()
 
             # --- Warehouse ---
             if "_warehouses" not in st.session_state:
@@ -223,7 +223,7 @@ with st.sidebar:
                 # Clear schema cache when DB changes
                 st.session_state.pop("_schemas", None)
                 st.session_state.ctx_schema = None
-                st.rerun()
+                st.experimental_rerun()
 
             # --- Schema (depends on database) ---
             schemas = []
@@ -271,7 +271,7 @@ with st.sidebar:
                     for k in list(st.session_state.keys()):
                         if k.startswith("_"):
                             del st.session_state[k]
-                    st.rerun()
+                    st.experimental_rerun()
             with col_disc:
                 if st.button("🔌 Disconnect", use_container_width=True):
                     try:
@@ -281,7 +281,7 @@ with st.sidebar:
                     except Exception:
                         pass
                     st.session_state.clear()
-                    st.rerun()
+                    st.experimental_rerun()
 
         st.divider()
     else:
@@ -392,7 +392,7 @@ def snowflake_table_picker(prefix):
                             if k.startswith("_sf_")]
             for k in keys_to_clear:
                 del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     if selected_db and selected_schema and selected_table:
         return f'"{selected_db}"."{selected_schema}"."{selected_table}"'
@@ -694,7 +694,7 @@ def stage_file_picker(prefix, file_types=None):
             for k in list(st.session_state.keys()):
                 if k.startswith("_sf_stage"):
                     del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     if selected_stage and selected_display:
         return selected_stage, file_map[selected_display]
@@ -1080,7 +1080,7 @@ Output only JSON, no markdown."""
 
                         st.session_state.synthetic_values = synthetic_values
                         st.success(f"✅ Generated synthetic test values for {len(synthetic_values)} columns!")
-                        st.rerun()
+                        st.experimental_rerun()
                     else:
                         st.warning("No matches found")
 
@@ -1216,4 +1216,4 @@ Output only JSON, no markdown."""
         st.write("")
         st.write("")
         if st.button("➡️ Next: Marketplace", type="primary", use_container_width=True):
-            st.switch_page("pages/dq_marketplace.py")
+            st.info("👈 Navigate to **DQ Marketplace** in the sidebar")

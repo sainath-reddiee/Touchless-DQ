@@ -34,7 +34,7 @@ if "current_check_index" not in st.session_state:
 # Check if we have checks from marketplace
 if not st.session_state.get('selected_checks'):
     st.error("⚠️ No checks found! Please go back to the marketplace and select some checks first.")
-    st.page_link("pages/dq_marketplace.py", label="⬅️ Go to Marketplace", icon="🏪")
+    st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
     st.stop()
 
 # Build list of selected checks
@@ -48,7 +48,7 @@ for check_key, check_data in st.session_state.selected_checks.items():
 
 if not all_checks:
     st.warning("No checks selected. Please go back to the marketplace and select some checks.")
-    st.page_link("pages/dq_marketplace.py", label="⬅️ Go to Marketplace", icon="🏪")
+    st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
     st.stop()
 
 # Sidebar navigation
@@ -70,12 +70,12 @@ with st.sidebar:
             type="primary" if is_current else "secondary"
         ):
             st.session_state.current_check_index = idx
-            st.rerun()
+            st.experimental_rerun()
 
     st.divider()
 
     if st.button("⬅️ Back to Marketplace", use_container_width=True):
-        st.switch_page("pages/dq_marketplace.py")
+        st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
 
 # Progress indicator
 st.progress((st.session_state.current_check_index + 1) / len(all_checks))
@@ -228,7 +228,7 @@ Keep it concise (3-5 sentences per point)."""
             st.session_state.selected_checks[current_check['key']]['row']['SODACL Yaml Check Definition'] = \
                 st.session_state[f'ai_improved_{st.session_state.current_check_index}']
             del st.session_state[f'ai_improved_{st.session_state.current_check_index}']
-            st.rerun()
+            st.experimental_rerun()
 
     # Show AI explanation
     if st.session_state.get(f'ai_explanation_{st.session_state.current_check_index}'):
@@ -243,12 +243,12 @@ col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 with col1:
     if st.button("⬅️ Previous", use_container_width=True, disabled=st.session_state.current_check_index == 0):
         st.session_state.current_check_index -= 1
-        st.rerun()
+        st.experimental_rerun()
 
 with col2:
     if st.button("➡️ Next", use_container_width=True, disabled=st.session_state.current_check_index >= len(all_checks) - 1):
         st.session_state.current_check_index += 1
-        st.rerun()
+        st.experimental_rerun()
 
 with col3:
     if st.button("🧪 Test Check", use_container_width=True, type="secondary"):
@@ -259,7 +259,7 @@ with col4:
         st.success(f"✅ Approved: {current_row['Check name']}")
         if st.session_state.current_check_index < len(all_checks) - 1:
             st.session_state.current_check_index += 1
-            st.rerun()
+            st.experimental_rerun()
         else:
             st.balloons()
             st.info("🎉 All checks reviewed!")
@@ -374,7 +374,7 @@ if st.session_state.get(f'show_test_{st.session_state.current_check_index}', Fal
                 key=f"close_test_{st.session_state.current_check_index}"
             ):
                 st.session_state[f'show_test_{st.session_state.current_check_index}'] = False
-                st.rerun()
+                st.experimental_rerun()
 
     with col_test_right:
         st.markdown("**Test Results:**")
@@ -537,6 +537,6 @@ if selected_rows:
         st.code(final_yaml, language="yaml")
         if st.button("Close YAML Preview"):
             st.session_state['show_final_yaml'] = False
-            st.rerun()
+            st.experimental_rerun()
 else:
     st.warning("No checks selected")

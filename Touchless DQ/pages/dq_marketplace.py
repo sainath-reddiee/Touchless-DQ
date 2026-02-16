@@ -48,7 +48,7 @@ with st.sidebar:
 
     if st.button("🔌 Reset Session"):
         st.session_state.clear()
-        st.rerun()
+        st.experimental_rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +339,7 @@ if selected_rows:
                 st.session_state['show_yaml_preview'] = True
 
     with col_btn3:
-        st.page_link("pages/dq_review_page.py", label="➡️ Review One-by-One", icon="📊", use_container_width=True)
+        st.info("Navigate to **DQ Review** page in the sidebar →")
 
     # YAML preview / download
     if IS_LOCAL:
@@ -356,6 +356,6 @@ if selected_rows:
         st.code(final_yaml, language="yaml")
         if st.button("Close Preview"):
             st.session_state['show_yaml_preview'] = False
-            st.rerun()
+            st.experimental_rerun()
 else:
     st.warning("No checks selected")
