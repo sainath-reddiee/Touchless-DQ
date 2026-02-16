@@ -37,51 +37,19 @@ def get_snowflake_session():
         IS_LOCAL = True
         return None
 
-def get_local_connection(account, user, password):
-    """Create a local snowflake.connector connection via username/password."""
+def get_local_connection():
+    """Create a local snowflake.connector connection via SSO (externalbrowser)."""
     import snowflake.connector
     conn = snowflake.connector.connect(
-        user=user,
-        password=password,
-        account=account,
+        account=st.session_state.get("sf_account", ""),
+        user=st.session_state.get("sf_user", ""),
+        authenticator="externalbrowser",
+        role=st.session_state.get("sf_role", None) or None,
+        warehouse=st.session_state.get("sf_warehouse", None) or None,
+        database=st.session_state.get("sf_database", None) or None,
+        schema=st.session_state.get("sf_schema", None) or None,
     )
     return conn
-
-
-def _fetch_list(query, col):
-    """Run a SHOW query and return sorted list of values from the given column."""
-    try:
-        conn = st.session_state.get("connection")
-        if conn:
-            cur = conn.cursor()
-            cur.execute(query)
-            cols = [d[0].lower() for d in cur.description]
-            rows = cur.fetchall()
-            cur.close()
-            idx = cols.index(col.lower()) if col.lower() in cols else 0
-            return sorted(set(r[idx] for r in rows if r[idx]))
-        elif session is not None:
-            df = session.sql(query).to_pandas()
-            df.columns = [c.lower() for c in df.columns]
-            return sorted(df[col.lower()].dropna().unique().tolist())
-    except Exception:
-        pass
-    return []
-
-
-def _use_context(kind, value):
-    """Execute a USE <kind> command to set the session context."""
-    try:
-        sql = f'USE {kind} "{value}"'
-        conn = st.session_state.get("connection")
-        if conn:
-            cur = conn.cursor()
-            cur.execute(sql)
-            cur.close()
-        elif session is not None:
-            session.sql(sql).collect()
-    except Exception as e:
-        st.error(f"Failed to set {kind}: {e}")
 
 
 # Try SiS first
@@ -98,15 +66,6 @@ if "catalog_df" not in st.session_state:
     st.session_state.catalog_df = None
 if "generated_checks" not in st.session_state:
     st.session_state.generated_checks = None
-# Context selection tracking
-if "ctx_role" not in st.session_state:
-    st.session_state.ctx_role = None
-if "ctx_warehouse" not in st.session_state:
-    st.session_state.ctx_warehouse = None
-if "ctx_database" not in st.session_state:
-    st.session_state.ctx_database = None
-if "ctx_schema" not in st.session_state:
-    st.session_state.ctx_schema = None
 
 if session is not None:
     st.session_state.connected = True
@@ -118,170 +77,77 @@ if session is not None:
 # ---------------------------------------------------------------------------
 with st.sidebar:
     if IS_LOCAL:
-        # ============================================================
-        # LOCAL MODE — Two-phase connection
-        # ============================================================
         st.header("⚙️ Snowflake Connection")
 
         if not st.session_state.connected:
-            # ---- Phase 1: Authenticate ----
-            sf_account = st.text_input(
-                "Account Identifier",
+            # ---- Connection form: all fields up front ----
+            st.session_state["sf_account"] = st.text_input(
+                "Account Identifier *",
                 value=st.session_state.get("sf_account", ""),
-                help="e.g. xy12345.us-east-1",
                 placeholder="xy12345.us-east-1"
             )
-            sf_user = st.text_input(
-                "Username",
+            st.session_state["sf_user"] = st.text_input(
+                "Username *",
                 value=st.session_state.get("sf_user", ""),
                 placeholder="your_username"
             )
-            sf_password = st.text_input(
-                "Password",
-                type="password",
-                value="",
-                placeholder="••••••••"
+            st.caption("🔑 Authentication: SSO (browser will open)")
+            st.session_state["sf_role"] = st.text_input(
+                "Role",
+                value=st.session_state.get("sf_role", ""),
+                placeholder="SYSADMIN"
+            )
+            st.session_state["sf_warehouse"] = st.text_input(
+                "Warehouse",
+                value=st.session_state.get("sf_warehouse", ""),
+                placeholder="COMPUTE_WH"
+            )
+            st.session_state["sf_database"] = st.text_input(
+                "Database",
+                value=st.session_state.get("sf_database", ""),
+                placeholder="MY_DATABASE"
+            )
+            st.session_state["sf_schema"] = st.text_input(
+                "Schema",
+                value=st.session_state.get("sf_schema", ""),
+                placeholder="PUBLIC"
             )
 
             if st.button("🔐 Connect", use_container_width=True, type="primary"):
-                if not sf_account or not sf_user or not sf_password:
-                    st.error("Please fill in all fields")
+                if not st.session_state.sf_account or not st.session_state.sf_user:
+                    st.error("Account and Username are required")
                 else:
                     try:
                         with st.spinner("Connecting to Snowflake..."):
-                            conn = get_local_connection(sf_account, sf_user, sf_password)
+                            conn = get_local_connection()
                             st.session_state.connection = conn
                             st.session_state.connected = True
-                            st.session_state.sf_account = sf_account
-                            st.session_state.sf_user = sf_user
-                            # Clear cached context lists so they get re-fetched
-                            for k in ["_roles", "_warehouses", "_databases"]:
-                                st.session_state.pop(k, None)
                             st.experimental_rerun()
                     except Exception as e:
                         st.error(f"Connection failed: {e}")
-
         else:
-            # ---- Phase 2: Set context ----
-            st.success(f"✅ Connected as **{st.session_state.get('sf_user', '')}**")
-            st.caption(f"Account: `{st.session_state.get('sf_account', '')}`")
-            st.divider()
+            # ---- Connected: show summary ----
+            st.success("✅ Connected to Snowflake")
+            st.caption(f"**Account:** {st.session_state.get('sf_account', '')}")
+            st.caption(f"**User:** {st.session_state.get('sf_user', '')}")
+            if st.session_state.get("sf_role"):
+                st.caption(f"**Role:** {st.session_state.sf_role}")
+            if st.session_state.get("sf_warehouse"):
+                st.caption(f"**Warehouse:** {st.session_state.sf_warehouse}")
+            if st.session_state.get("sf_database"):
+                st.caption(f"**Database:** {st.session_state.sf_database}")
+            if st.session_state.get("sf_schema"):
+                st.caption(f"**Schema:** {st.session_state.sf_schema}")
 
-            st.subheader("🎯 Set Context")
-
-            # --- Role ---
-            if "_roles" not in st.session_state:
-                st.session_state._roles = _fetch_list("SHOW ROLES", "name")
-            roles = st.session_state._roles
-
-            selected_role = st.selectbox(
-                "Role",
-                [""] + roles,
-                index=0,
-                format_func=lambda x: x if x else "Select role...",
-                key="sb_role"
-            )
-            if selected_role and selected_role != st.session_state.ctx_role:
-                _use_context("ROLE", selected_role)
-                st.session_state.ctx_role = selected_role
-                # Clear downstream caches when role changes
-                for k in ["_warehouses", "_databases"]:
-                    st.session_state.pop(k, None)
+            if st.button("🔌 Disconnect", use_container_width=True):
+                try:
+                    conn = st.session_state.get("connection")
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
+                st.session_state.clear()
                 st.experimental_rerun()
-
-            # --- Warehouse ---
-            if "_warehouses" not in st.session_state:
-                st.session_state._warehouses = _fetch_list("SHOW WAREHOUSES", "name")
-            warehouses = st.session_state._warehouses
-
-            selected_wh = st.selectbox(
-                "Warehouse",
-                [""] + warehouses,
-                index=0,
-                format_func=lambda x: x if x else "Select warehouse...",
-                key="sb_warehouse"
-            )
-            if selected_wh and selected_wh != st.session_state.ctx_warehouse:
-                _use_context("WAREHOUSE", selected_wh)
-                st.session_state.ctx_warehouse = selected_wh
-
-            # --- Database ---
-            if "_databases" not in st.session_state:
-                st.session_state._databases = _fetch_list("SHOW DATABASES", "name")
-            databases = st.session_state._databases
-
-            selected_db = st.selectbox(
-                "Database",
-                [""] + databases,
-                index=0,
-                format_func=lambda x: x if x else "Select database...",
-                key="sb_database"
-            )
-            if selected_db and selected_db != st.session_state.ctx_database:
-                _use_context("DATABASE", selected_db)
-                st.session_state.ctx_database = selected_db
-                # Clear schema cache when DB changes
-                st.session_state.pop("_schemas", None)
-                st.session_state.ctx_schema = None
-                st.experimental_rerun()
-
-            # --- Schema (depends on database) ---
-            schemas = []
-            if selected_db:
-                cache_key = f"_schemas_{selected_db}"
-                if cache_key not in st.session_state:
-                    st.session_state[cache_key] = _fetch_list(
-                        f'SHOW SCHEMAS IN DATABASE "{selected_db}"', "name"
-                    )
-                schemas = st.session_state[cache_key]
-
-            selected_schema = st.selectbox(
-                "Schema",
-                [""] + schemas,
-                index=0,
-                format_func=lambda x: x if x else "Select schema...",
-                key="sb_schema"
-            )
-            if selected_schema and selected_schema != st.session_state.ctx_schema:
-                _use_context("SCHEMA", f"{selected_db}.{selected_schema}")
-                st.session_state.ctx_schema = selected_schema
-
-            # --- Context summary ---
-            st.divider()
-            ctx_parts = []
-            if st.session_state.ctx_role:
-                ctx_parts.append(f"**Role:** {st.session_state.ctx_role}")
-            if st.session_state.ctx_warehouse:
-                ctx_parts.append(f"**WH:** {st.session_state.ctx_warehouse}")
-            if st.session_state.ctx_database:
-                ctx_parts.append(f"**DB:** {st.session_state.ctx_database}")
-            if st.session_state.ctx_schema:
-                ctx_parts.append(f"**Schema:** {st.session_state.ctx_schema}")
-            if ctx_parts:
-                st.caption("Active Context")
-                for part in ctx_parts:
-                    st.markdown(part)
-            else:
-                st.caption("⚠️ No context set — select role, warehouse, database, and schema above")
-
-            # Refresh & Disconnect
-            col_ref, col_disc = st.columns(2)
-            with col_ref:
-                if st.button("🔄 Refresh", use_container_width=True, help="Re-fetch roles, warehouses, databases"):
-                    for k in list(st.session_state.keys()):
-                        if k.startswith("_"):
-                            del st.session_state[k]
-                    st.experimental_rerun()
-            with col_disc:
-                if st.button("🔌 Disconnect", use_container_width=True):
-                    try:
-                        conn = st.session_state.get("connection")
-                        if conn:
-                            conn.close()
-                    except Exception:
-                        pass
-                    st.session_state.clear()
-                    st.experimental_rerun()
 
         st.divider()
     else:
