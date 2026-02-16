@@ -1,0 +1,121 @@
+Domain,Critical Data Element,Short description of Critical Data Element,DQ Dimension,Check name,Check Description,SODACL Yaml Check Definition
+Property,LATITUDE,Latitude coordinate of the property location in decimal degrees,Completeness,latitude_completeness,Ensures latitude is present (no NULL values). Critical for property geolocation and mapping.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(LATITUDE) = 0:
+      name: ""[Critical] Property.LATITUDE — Completeness"""
+Property,LATITUDE,Latitude coordinate of the property location in decimal degrees,Validity,latitude_validity,"Validates latitude is within valid geographic range [-90, 90] and not a default zero value.","checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(LATITUDE) = 0:
+      # Valid range check
+      valid min: -90
+      valid max: 90
+      # Block default zero values
+      invalid values: [0, 0.0, 0.000]
+      name: ""[Critical] Property.LATITUDE — Validity"""
+Property,LONGITUDE,Longitude coordinate of the property location in decimal degrees,Completeness,longitude_completeness,Ensures longitude is present (no NULL values). Critical for property geolocation and mapping.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(LONGITUDE) = 0:
+      name: ""[Critical] Property.LONGITUDE — Completeness"""
+Property,LONGITUDE,Longitude coordinate of the property location in decimal degrees,Validity,longitude_validity,"Validates longitude is within valid geographic range [-180, 180] and not a default zero value.","checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(LONGITUDE) = 0:
+      # Valid range check
+      valid min: -180
+      valid max: 180
+      # Block default zero values
+      invalid values: [0, 0.0, 0.000]
+      name: ""[Critical] Property.LONGITUDE — Validity"""
+Property,POSTAL_CODE,Postal or ZIP code of the property location,Completeness,postal_code_completeness,Ensures postal code is present for all properties. Required for address validation and mail delivery.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(POSTAL_CODE) = 0:
+      name: ""[Critical] Property.POSTAL_CODE — Completeness"""
+Property,POSTAL_CODE,Postal or ZIP code of the property location,Validity,postal_code_validity,Validates postal code format is not empty string or placeholder values.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(POSTAL_CODE) = 0:
+      invalid values: ['', 'N/A', 'NULL', 'UNKNOWN', '00000']
+      name: ""[Major] Property.POSTAL_CODE — Validity"""
+Property,CITY_NAME,Name of the city where the property is located,Completeness,city_name_completeness,Ensures city name is present for all properties. Critical for location identification and reporting.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(CITY_NAME) = 0:
+      name: ""[Critical] Property.CITY_NAME — Completeness"""
+Property,PROPERTY_BUILDING_CODE,Unique identifier code for the property building,Completeness,property_building_code_completeness,Ensures building code is present. This is the primary identifier for properties.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(PROPERTY_BUILDING_CODE) = 0:
+      name: ""[Critical] Property.PROPERTY_BUILDING_CODE — Completeness"""
+Property,PROPERTY_BUILDING_CODE,Unique identifier code for the property building,Uniqueness,property_building_code_uniqueness,Ensures building codes are unique across all properties. Duplicates would indicate data quality issues.,"checks for VW_CE_PROPERTY_DQ:
+  - duplicate_count(PROPERTY_BUILDING_CODE) = 0:
+      name: ""[Critical] Property.PROPERTY_BUILDING_CODE — Uniqueness"""
+Property,NET_RENTABLE_AREA,Net rentable area of the property available for lease,Validity,net_rentable_area_validity,Validates net rentable area is positive and within reasonable range. Zero or negative values indicate data errors.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(NET_RENTABLE_AREA) = 0:
+      valid min: 0.01
+      valid max: 10000000
+      invalid values: [0, 0.0, -1]
+      name: ""[Major] Property.NET_RENTABLE_AREA — Validity"""
+Property,SPACE_AVAILABILITY_STATUS_DESC,Description of the space availability status,Validity,space_availability_status_validity,Validates status values are from the approved list of availability statuses.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(SPACE_AVAILABILITY_STATUS_DESC) = 0:
+      valid values: ['Available', 'Occupied', 'Under Construction', 'Reserved', 'Maintenance']
+      name: ""[Major] Property.SPACE_AVAILABILITY_STATUS_DESC — Validity"""
+Property,ADDRESS_LINE1,First line of the property address,Completeness,address_line1_completeness,Ensures primary address line is present. Required for property identification and communication.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(ADDRESS_LINE1) = 0:
+      name: ""[Critical] Property.ADDRESS_LINE1 — Completeness"""
+Property,PROPERTY_TYPE,"Type or classification of the property (e.g., Office, Retail, Industrial)",Completeness,property_type_completeness,Ensures property type is specified for all properties. Required for property classification and reporting.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(PROPERTY_TYPE) = 0:
+      name: ""[Critical] Property.PROPERTY_TYPE — Completeness"""
+Property,MARKET_NAME,Primary market or region where the property is located,Completeness,market_name_completeness,Ensures market classification is present. Critical for market analysis and regional reporting.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(MARKET_NAME) = 0:
+      name: ""[Critical] Property.MARKET_NAME — Completeness"""
+Property,BUILDING_CODE,Unique building identifier,Completeness,building_code_completeness,Ensures building code is present for tracking purposes.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(BUILDING_CODE) = 0:
+      name: ""[Critical] Property.BUILDING_CODE — Completeness"""
+Property,YEAR_BUILT,Year when the property was constructed,Validity,year_built_validity,Validates year built is within reasonable historical range and not in the future.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(YEAR_BUILT) = 0:
+      valid min: 1800
+      valid max: 2025
+      name: ""[Major] Property.YEAR_BUILT — Validity"""
+Property,ZIP_CODE,ZIP or postal code of the property,Completeness,zip_code_completeness,Ensures ZIP code is populated for US properties.,"checks for VW_CE_PROPERTY_DQ:
+  - missing_count(ZIP_CODE) = 0:
+      name: ""[Critical] Property.ZIP_CODE — Completeness"""
+Property,GROSS_LEASABLE_AREA,Total gross leasable area of the property,Validity,gross_leasable_area_validity,Validates gross leasable area is positive and within expected range.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(GROSS_LEASABLE_AREA) = 0:
+      valid min: 1
+      valid max: 5000000
+      name: ""[Major] Property.GROSS_LEASABLE_AREA — Validity"""
+Property,TOTAL_AVAILABLE_SURFACE_AREA,Total surface area available in the property,Consistency,available_area_consistency,Ensures total available area equals the sum of vacant and occupied areas. Inconsistency indicates calculation errors.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(TOTAL_AVAILABLE_SURFACE_AREA) = 0:
+      valid formula: TOTAL_AVAILABLE_SURFACE_AREA >= TOTAL_VACANT_AREA
+      name: ""[Major] Property.TOTAL_AVAILABLE_SURFACE_AREA — Consistency"""
+Property,VACANT_AREA,Amount of vacant space in the property,Consistency,vacant_area_consistency,Ensures vacant area does not exceed total available area. Logical inconsistency would indicate data error.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(VACANT_AREA) = 0:
+      valid formula: VACANT_AREA <= TOTAL_AVAILABLE_SURFACE_AREA
+      name: ""[Critical] Property.VACANT_AREA — Consistency"""
+Property,NET_RENTABLE_AREA_UOM,Unit of measure for net rentable area,Consistency,area_uom_consistency,Ensures all area unit of measures are consistent within the same record (NET_RENTABLE_AREA_UOM should match AVAILABLE_SPACE_UOM).,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: NET_RENTABLE_AREA_UOM != AVAILABLE_SPACE_UOM
+      name: ""[Major] Property.NET_RENTABLE_AREA_UOM — Consistency"""
+Property,LATITUDE,Latitude coordinate of the property location in decimal degrees,Accuracy,latitude_accuracy,Cross-validates latitude coordinates against known city locations. Coordinates must align with specified CITY_NAME geography.,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: |
+        (CITY_NAME = 'Paris' AND (LATITUDE < 48.0 OR LATITUDE > 49.0)) OR
+        (CITY_NAME = 'Berlin' AND (LATITUDE < 52.0 OR LATITUDE > 53.0))
+      name: ""[Major] Property.LATITUDE — Accuracy"""
+Property,SPACE_AVAILABILITY_STATUS_SKEY,Surrogate key for space availability status,Integrity,status_key_integrity,Validates that status surrogate key has corresponding description. Orphaned keys indicate broken references.,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: SPACE_AVAILABILITY_STATUS_SKEY IS NOT NULL AND SPACE_AVAILABILITY_STATUS_DESC IS NULL
+      name: ""[Critical] Property.SPACE_AVAILABILITY_STATUS_SKEY — Integrity"""
+Property,LISTINGREP,Listing representative or agent for the property,Integrity,listingrep_integrity,Ensures listing representative has associated country information. Missing country indicates incomplete relationship.,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: LISTINGREP IS NOT NULL AND LISTINGREP_COUNTRIES IS NULL
+      name: ""[Major] Property.LISTINGREP — Integrity"""
+Property,ASSOCIATED_PROJECT_COMPLETION_DATE,Date when the associated project was completed,Timeliness,project_completion_timeliness,Ensures completion dates are not in the future. Future dates indicate data entry errors or incorrect system dates.,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: ASSOCIATED_PROJECT_COMPLETION_DATE > CURRENT_DATE()
+      name: ""[Major] Property.ASSOCIATED_PROJECT_COMPLETION_DATE — Timeliness"""
+Property,POSTAL_CODE,Postal or ZIP code of the property location,Conformity,postal_code_format_conformity,Validates postal code follows standard format patterns for European postal codes.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(POSTAL_CODE) = 0:
+      valid regex: ^[A-Z0-9]{3,10}$
+      name: ""[Major] Property.POSTAL_CODE — Conformity"""
+Property,STREET_NAME,Name of the street where the property is located,Conformity,street_name_conformity,Ensures street names follow proper naming conventions without special characters or numbers only.,"checks for VW_CE_PROPERTY_DQ:
+  - invalid_count(STREET_NAME) = 0:
+      valid regex: ^[A-Za-z0-9\s\-\.]+$
+      invalid regex: ^[0-9]+$
+      name: ""[Minor] Property.STREET_NAME — Conformity"""
+Property,LAST_UPDATED_DATE,Timestamp of when the property record was last updated,Timeliness,record_freshness_timeliness,Ensures property records have been updated within the last 90 days. Stale data may be inaccurate.,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: LAST_UPDATED_DATE < DATEADD(day, -90, CURRENT_DATE())
+      name: ""[Major] Property.LAST_UPDATED_DATE — Timeliness"""
+Property,PROPERTY_STATUS,Current operational status of the property,Consistency,property_status_consistency,Validates property status aligns with availability status. Inactive properties should not have available spaces.,"checks for VW_CE_PROPERTY_DQ:
+  - failed rows:
+      fail condition: PROPERTY_STATUS = 'Inactive' AND SPACE_AVAILABILITY_STATUS_DESC = 'Available'
+      name: ""[Critical] Property.PROPERTY_STATUS — Consistency"""
