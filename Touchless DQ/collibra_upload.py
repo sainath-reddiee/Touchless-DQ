@@ -120,9 +120,105 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
+# Helper — run SQL query and return DataFrame (works in both modes)
+# ---------------------------------------------------------------------------
+def run_query_df(query):
+    """Execute a SQL query and return results as a pandas DataFrame."""
+    try:
+        if session is not None:
+            df = session.sql(query).to_pandas()
+        elif st.session_state.get("connection"):
+            cur = st.session_state.connection.cursor()
+            cur.execute(query)
+            columns = [desc[0] for desc in cur.description]
+            data = cur.fetchall()
+            cur.close()
+            df = pd.DataFrame(data, columns=columns)
+        else:
+            return pd.DataFrame()
+        # Normalize column names to lowercase for consistency
+        df.columns = [c.lower() for c in df.columns]
+        return df
+    except Exception as e:
+        st.error(f"Query error: {e}")
+        return pd.DataFrame()
+
+
+def get_cached_list(cache_key, query, column_name):
+    """Fetch and cache a list of values from a SQL query."""
+    if cache_key not in st.session_state:
+        df = run_query_df(query)
+        st.session_state[cache_key] = sorted(df[column_name].tolist()) if column_name in df.columns else []
+    return st.session_state[cache_key]
+
+
+# ---------------------------------------------------------------------------
+# Helper — cascading Database → Schema → Table picker
+# ---------------------------------------------------------------------------
+def snowflake_table_picker(prefix):
+    """Render cascading Database / Schema / Table dropdowns.
+    Returns a fully-qualified table name like "DB"."SCHEMA"."TABLE", or None.
+    """
+    # Shared data caches (so both pickers benefit from the same fetch)
+    databases = get_cached_list("_sf_databases", "SHOW DATABASES", "name")
+
+    col_db, col_schema, col_table, col_refresh = st.columns([3, 3, 3, 1])
+
+    with col_db:
+        selected_db = st.selectbox(
+            "Database", [""] + databases, key=f"{prefix}_db",
+            format_func=lambda x: x if x else "Select database..."
+        )
+
+    # Fetch schemas when a database is selected
+    schemas = []
+    if selected_db:
+        schemas = get_cached_list(
+            f"_sf_schemas_{selected_db}",
+            f'SHOW SCHEMAS IN DATABASE "{selected_db}"',
+            "name"
+        )
+
+    with col_schema:
+        selected_schema = st.selectbox(
+            "Schema", [""] + schemas, key=f"{prefix}_schema",
+            format_func=lambda x: x if x else "Select schema..."
+        )
+
+    # Fetch tables when a schema is selected
+    tables = []
+    if selected_db and selected_schema:
+        tables = get_cached_list(
+            f"_sf_tables_{selected_db}_{selected_schema}",
+            f'SHOW TABLES IN SCHEMA "{selected_db}"."{selected_schema}"',
+            "name"
+        )
+
+    with col_table:
+        selected_table = st.selectbox(
+            "Table", [""] + tables, key=f"{prefix}_table",
+            format_func=lambda x: x if x else "Select table..."
+        )
+
+    with col_refresh:
+        st.write("")  # spacer to align with selectbox labels
+        st.write("")
+        if st.button("🔄", key=f"{prefix}_refresh", help="Refresh database/schema/table lists"):
+            keys_to_clear = [k for k in list(st.session_state.keys())
+                            if k.startswith("_sf_")]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.rerun()
+
+    if selected_db and selected_schema and selected_table:
+        return f'"{selected_db}"."{selected_schema}"."{selected_table}"'
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helper — call Snowflake Cortex LLM (works in both modes)
 # ---------------------------------------------------------------------------
-def call_llm(prompt: str, model_name: str):
+def call_llm(prompt, model_name):
     """Call Snowflake Cortex LLM — supports both Snowpark session and connector."""
     try:
         escaped_prompt = prompt.replace("'", "''")
@@ -153,9 +249,53 @@ def call_llm(prompt: str, model_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Helper — call Cortex CLASSIFY_TEXT (column classification)
+# ---------------------------------------------------------------------------
+def classify_columns(descriptions):
+    """Use SNOWFLAKE.CORTEX.CLASSIFY_TEXT to classify column descriptions."""
+    categories = ['PII', 'Financial', 'Geographic', 'Temporal',
+                  'Categorical', 'Identifier', 'Measurement', 'Text', 'Other']
+    categories_sql = ", ".join([f"'{c}'" for c in categories])
+
+    results = {}
+    for col_name, description in descriptions.items():
+        if not description or str(description).strip() == '':
+            results[col_name] = {"label": "Other", "score": 0.0}
+            continue
+        try:
+            escaped = str(description).replace("'", "''")
+            query = f"""
+            SELECT SNOWFLAKE.CORTEX.CLASSIFY_TEXT(
+                '{escaped}',
+                ARRAY_CONSTRUCT({categories_sql})
+            ) AS classification
+            """
+            if session is not None:
+                result = session.sql(query).collect()
+                raw = result[0]["CLASSIFICATION"] if result else "{}"
+            elif st.session_state.get("connection"):
+                cur = st.session_state.connection.cursor()
+                cur.execute(query)
+                result = cur.fetchone()
+                cur.close()
+                raw = result[0] if result else "{}"
+            else:
+                raw = "{}"
+
+            if isinstance(raw, str):
+                parsed = json.loads(raw)
+            else:
+                parsed = raw
+            results[col_name] = parsed
+        except Exception:
+            results[col_name] = {"label": "Other", "score": 0.0}
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Helper — parse JSON from LLM response (handles markdown fences)
 # ---------------------------------------------------------------------------
-def parse_llm_json(raw: str):
+def parse_llm_json(raw):
     """Best-effort extraction of a JSON object from a raw LLM response."""
     cleaned = raw.strip()
     if '```' in cleaned:
@@ -172,7 +312,7 @@ def parse_llm_json(raw: str):
 # ---------------------------------------------------------------------------
 # Helper — save dataframe to Snowflake (works in both modes)
 # ---------------------------------------------------------------------------
-def save_to_snowflake(df: pd.DataFrame, table_name: str):
+def save_to_snowflake(df, table_name):
     """Save a pandas DataFrame to a Snowflake table."""
     try:
         if session is not None:
@@ -199,7 +339,7 @@ def save_to_snowflake(df: pd.DataFrame, table_name: str):
 # ---------------------------------------------------------------------------
 # Helper — load table (works in both modes)
 # ---------------------------------------------------------------------------
-def load_table(table_name: str) -> pd.DataFrame:
+def load_table(table_name):
     """Load a Snowflake table as a pandas DataFrame."""
     if session is not None:
         return session.table(table_name).to_pandas()
@@ -235,19 +375,20 @@ catalog_source = st.radio(
 )
 
 if catalog_source == "Snowflake Table":
-    catalog_table = st.text_input(
-        "Fully-qualified table name",
-        value="",
-        placeholder="DB.SCHEMA.DQ_CHECKS_CATALOG",
-        key="catalog_table_input"
-    )
-    if st.button("📥 Load Catalog", key="load_catalog_btn") and catalog_table:
-        try:
-            catalog_df = load_table(catalog_table)
-            st.session_state.catalog_df = catalog_df
-            st.success(f"✅ Catalog loaded: {len(catalog_df)} checks")
-        except Exception as e:
-            st.error(f"Failed to load table: {e}")
+    st.caption("Browse and select a table from your Snowflake account")
+    selected_catalog_table = snowflake_table_picker("catalog")
+
+    if st.button("📥 Load Catalog", key="load_catalog_btn"):
+        if selected_catalog_table:
+            try:
+                with st.spinner("Loading catalog..."):
+                    catalog_df = load_table(selected_catalog_table)
+                    st.session_state.catalog_df = catalog_df
+                    st.success(f"✅ Catalog loaded: {len(catalog_df)} checks")
+            except Exception as e:
+                st.error(f"Failed to load table: {e}")
+        else:
+            st.warning("Please select a database, schema, and table first")
 else:
     catalog_file = st.file_uploader(
         "Upload the catalog Excel file",
@@ -279,19 +420,20 @@ metadata_source = st.radio(
 
 metadata_df = None
 if metadata_source == "Snowflake Table":
-    metadata_table = st.text_input(
-        "Fully-qualified table name",
-        value="",
-        placeholder="DB.SCHEMA.COLLIBRA_METADATA",
-        key="metadata_table_input"
-    )
-    if st.button("📥 Load Metadata", key="load_metadata_btn") and metadata_table:
-        try:
-            metadata_df = load_table(metadata_table)
-            st.session_state.collibra_metadata = metadata_df
-            st.success(f"✅ Metadata loaded: {len(metadata_df)} columns")
-        except Exception as e:
-            st.error(f"Failed to load table: {e}")
+    st.caption("Browse and select a table from your Snowflake account")
+    selected_metadata_table = snowflake_table_picker("metadata")
+
+    if st.button("📥 Load Metadata", key="load_metadata_btn"):
+        if selected_metadata_table:
+            try:
+                with st.spinner("Loading metadata..."):
+                    metadata_df = load_table(selected_metadata_table)
+                    st.session_state.collibra_metadata = metadata_df
+                    st.success(f"✅ Metadata loaded: {len(metadata_df)} columns")
+            except Exception as e:
+                st.error(f"Failed to load table: {e}")
+        else:
+            st.warning("Please select a database, schema, and table first")
 else:
     metadata_file = st.file_uploader(
         "Upload Collibra metadata Excel/CSV",
@@ -313,6 +455,132 @@ if st.session_state.collibra_metadata is not None:
         st.dataframe(metadata_df, use_container_width=True)
 
 st.divider()
+
+
+# ===========================================================================
+# Step 2.5 — AI Data Profiling (Cortex-powered)
+# ===========================================================================
+if st.session_state.collibra_metadata is not None:
+    st.header("Step 2.5: AI Data Profiling")
+    st.caption("Use Snowflake Cortex AI to analyze your metadata and get intelligent recommendations")
+
+    col_profile, col_classify = st.columns(2)
+
+    with col_profile:
+        if st.button("🔬 AI Profile Data", key="ai_profile_btn", use_container_width=True):
+            with st.spinner("Cortex AI is profiling your metadata..."):
+                meta = st.session_state.collibra_metadata
+                sample = meta.head(20).to_dict('records')
+                columns_list = meta.columns.tolist()
+
+                profiling_prompt = f"""You are a data quality expert. Analyze this metadata and provide a data profiling report.
+
+Columns available: {columns_list}
+
+Sample data (first 20 rows):
+{json.dumps(sample, indent=2, default=str)}
+
+For each column, provide:
+1. Inferred data type and pattern
+2. Potential quality issues
+3. Recommended DQ checks
+4. Completeness assessment
+
+Also provide an overall data quality readiness score (0-100).
+
+Respond ONLY with valid JSON:
+{{
+    "overall_score": 85,
+    "summary": "Brief overall assessment...",
+    "columns": [
+        {{
+            "name": "column_name",
+            "inferred_type": "string/numeric/date/etc",
+            "quality_issues": ["issue1", "issue2"],
+            "recommended_checks": ["completeness", "validity"],
+            "completeness": "high/medium/low"
+        }}
+    ],
+    "recommendations": ["rec1", "rec2", "rec3"]
+}}
+
+Output only JSON, no markdown."""
+
+                response = call_llm(profiling_prompt, st.session_state.model)
+                if response:
+                    try:
+                        profile = parse_llm_json(response)
+                        st.session_state.ai_profile = profile
+                    except Exception as e:
+                        st.error(f"Failed to parse profiling results: {e}")
+                        with st.expander("Raw response"):
+                            st.code(response)
+
+    with col_classify:
+        if st.button("🏷️ AI Classify Columns", key="ai_classify_btn", use_container_width=True,
+                     help="Uses CORTEX.CLASSIFY_TEXT to categorize each column"):
+            with st.spinner("Cortex CLASSIFY_TEXT is categorizing columns..."):
+                meta = st.session_state.collibra_metadata
+                desc_col = None
+                for c in ['Column description', 'Description', 'COLUMN_DESCRIPTION', 'description']:
+                    if c in meta.columns:
+                        desc_col = c
+                        break
+
+                name_col = None
+                for c in ['Column name', 'COLUMN_NAME', 'column_name', 'Name']:
+                    if c in meta.columns:
+                        name_col = c
+                        break
+
+                if desc_col and name_col:
+                    descriptions = {}
+                    for _, row in meta.head(20).iterrows():
+                        col_name = str(row[name_col])
+                        descriptions[col_name] = str(row.get(desc_col, col_name))
+
+                    classifications = classify_columns(descriptions)
+                    st.session_state.ai_classifications = classifications
+                else:
+                    st.warning("Could not find column name/description fields in metadata. "
+                              "Expected columns like 'Column name' and 'Column description'.")
+
+    # Display profiling results
+    if st.session_state.get("ai_profile"):
+        profile = st.session_state.ai_profile
+
+        col_score, col_summary = st.columns([1, 3])
+        with col_score:
+            score = profile.get("overall_score", 0)
+            st.metric("Quality Readiness", f"{score}/100")
+        with col_summary:
+            st.info(profile.get("summary", "No summary available"))
+
+        with st.expander("📊 Column-Level Analysis", expanded=True):
+            col_data = profile.get("columns", [])
+            if col_data:
+                profile_df = pd.DataFrame(col_data)
+                st.dataframe(profile_df, use_container_width=True)
+
+        with st.expander("💡 AI Recommendations"):
+            for rec in profile.get("recommendations", []):
+                st.markdown(f"- {rec}")
+
+    # Display classification results
+    if st.session_state.get("ai_classifications"):
+        with st.expander("🏷️ Column Classifications (via CORTEX.CLASSIFY_TEXT)"):
+            cls_data = []
+            for col_name, cls in st.session_state.ai_classifications.items():
+                cls_data.append({
+                    "Column": col_name,
+                    "Category": cls.get("label", "Unknown"),
+                    "Confidence": f"{cls.get('score', 0):.2f}" if isinstance(cls.get('score'), (int, float)) else str(cls.get('score', ''))
+                })
+            if cls_data:
+                st.dataframe(pd.DataFrame(cls_data), use_container_width=True)
+
+    st.divider()
+
 
 # ===========================================================================
 # Step 3 — AI Matching
@@ -474,7 +742,7 @@ if st.session_state.generated_checks is not None:
 
     generated_df = st.session_state.generated_checks
 
-    col1, col2, col3 = st.columns([2, 2, 1])
+    col1, col2, col3, col4 = st.columns([2, 2, 1, 2])
     with col1:
         st.metric("Total Checks", len(generated_df))
     with col2:
@@ -483,8 +751,96 @@ if st.session_state.generated_checks is not None:
         if st.button("💾 Save to Snowflake", key="save_checks_btn", use_container_width=True):
             if save_to_snowflake(generated_df, "DQ_GENERATED_CHECKS"):
                 st.success("✅ Saved to table `DQ_GENERATED_CHECKS`")
+    with col4:
+        if st.button("📈 AI Coverage Assessment", key="ai_coverage_btn", use_container_width=True):
+            with st.spinner("Cortex AI is assessing DQ coverage..."):
+                checks_summary = []
+                for _, row in generated_df.iterrows():
+                    checks_summary.append({
+                        "cde": row["Critical Data Element"],
+                        "domain": row["Domain"],
+                        "dimension": row["DQ Dimension"],
+                        "check": row["Check name"]
+                    })
+
+                coverage_prompt = f"""You are a data quality expert. Assess the completeness and coverage of these generated DQ checks.
+
+Generated Checks:
+{json.dumps(checks_summary, indent=2)}
+
+Standard DQ Dimensions: Completeness, Validity, Accuracy, Consistency, Timeliness, Uniqueness
+
+Evaluate:
+1. Which CDEs have good coverage across dimensions?
+2. Which CDEs are missing important checks?
+3. Are there any DQ dimensions underrepresented?
+4. Overall coverage score (0-100)
+5. Specific recommendations to improve coverage
+
+Respond ONLY with valid JSON:
+{{
+    "coverage_score": 75,
+    "summary": "Overall assessment...",
+    "well_covered": ["CDE1 has completeness + validity + accuracy"],
+    "gaps": ["CDE2 missing uniqueness check", "No timeliness checks found"],
+    "dimension_coverage": {{
+        "Completeness": "good",
+        "Validity": "good",
+        "Accuracy": "partial",
+        "Consistency": "missing",
+        "Timeliness": "missing",
+        "Uniqueness": "partial"
+    }},
+    "recommendations": ["Add uniqueness checks for ID columns", "Consider timeliness checks for date fields"]
+}}
+
+Output only JSON, no markdown."""
+
+                coverage_response = call_llm(coverage_prompt, st.session_state.model)
+                if coverage_response:
+                    try:
+                        coverage = parse_llm_json(coverage_response)
+                        st.session_state.ai_coverage = coverage
+                    except Exception as e:
+                        st.error(f"Failed to parse coverage assessment: {e}")
+                        with st.expander("Raw response"):
+                            st.code(coverage_response)
 
     st.dataframe(generated_df, use_container_width=True, height=400)
+
+    # Show AI Coverage Assessment results
+    if st.session_state.get("ai_coverage"):
+        coverage = st.session_state.ai_coverage
+        st.divider()
+        st.subheader("📈 AI Coverage Assessment")
+
+        cov_col1, cov_col2 = st.columns([1, 3])
+        with cov_col1:
+            cov_score = coverage.get("coverage_score", 0)
+            st.metric("Coverage Score", f"{cov_score}/100")
+        with cov_col2:
+            st.info(coverage.get("summary", ""))
+
+        cov_col_left, cov_col_right = st.columns(2)
+        with cov_col_left:
+            st.markdown("**Well Covered:**")
+            for item in coverage.get("well_covered", []):
+                st.markdown(f"✅ {item}")
+
+            st.markdown("**Dimension Coverage:**")
+            dim_cov = coverage.get("dimension_coverage", {})
+            for dim, status in dim_cov.items():
+                icon = "🟢" if status == "good" else "🟡" if status == "partial" else "🔴"
+                st.markdown(f"{icon} **{dim}**: {status}")
+
+        with cov_col_right:
+            st.markdown("**Gaps Identified:**")
+            for gap in coverage.get("gaps", []):
+                st.markdown(f"⚠️ {gap}")
+
+            st.markdown("**Recommendations:**")
+            for rec in coverage.get("recommendations", []):
+                st.markdown(f"💡 {rec}")
 
     st.divider()
 

@@ -161,11 +161,79 @@ with col_right:
     new_soda_check = st.text_area(
         "SODA CL",
         value=current_row['SODACL Yaml Check Definition'],
-        height=500,
+        height=400,
         label_visibility="collapsed",
         key=f"review_soda_{st.session_state.current_check_index}"
     )
     st.session_state.selected_checks[current_check['key']]['row']['SODACL Yaml Check Definition'] = new_soda_check
+
+    # AI-powered check improvement
+    col_improve, col_explain = st.columns(2)
+    with col_improve:
+        if st.button("🤖 AI Improve Check", key=f"ai_improve_{st.session_state.current_check_index}",
+                     use_container_width=True):
+            with st.spinner("Cortex AI is improving your check..."):
+                improve_prompt = f"""You are a SODA CL data quality expert. Improve this check definition.
+
+Column: {current_row['Critical Data Element']}
+Domain: {current_row['Domain']}
+DQ Dimension: {current_row['DQ Dimension']}
+Description: {current_row['Check Description']}
+
+Current SODA CL Check:
+{new_soda_check}
+
+Improve the check by:
+1. Adding better thresholds or ranges where applicable
+2. Handling edge cases (nulls, empty strings, out-of-range)
+3. Using best-practice SODA CL syntax
+4. Adding complementary sub-checks if beneficial
+
+Return ONLY the improved SODA CL YAML. No explanation, no markdown fences."""
+
+                improved = call_cortex(improve_prompt, st.session_state.get('model', 'llama3.1-70b'))
+                if improved:
+                    st.session_state[f'ai_improved_{st.session_state.current_check_index}'] = improved.strip()
+
+    with col_explain:
+        if st.button("💡 AI Explain Check", key=f"ai_explain_{st.session_state.current_check_index}",
+                     use_container_width=True):
+            with st.spinner("Cortex AI is explaining this check..."):
+                explain_prompt = f"""Explain this SODA CL data quality check in simple terms.
+
+Column: {current_row['Critical Data Element']}
+DQ Dimension: {current_row['DQ Dimension']}
+
+SODA CL Check:
+{new_soda_check}
+
+Provide:
+1. What this check does in plain English
+2. What values would PASS
+3. What values would FAIL
+4. Any limitations or edge cases
+
+Keep it concise (3-5 sentences per point)."""
+
+                explanation = call_cortex(explain_prompt, st.session_state.get('model', 'llama3.1-70b'))
+                if explanation:
+                    st.session_state[f'ai_explanation_{st.session_state.current_check_index}'] = explanation.strip()
+
+    # Show AI-improved check
+    if st.session_state.get(f'ai_improved_{st.session_state.current_check_index}'):
+        st.markdown("**AI-Improved Check:**")
+        st.code(st.session_state[f'ai_improved_{st.session_state.current_check_index}'], language="yaml")
+        if st.button("✅ Accept Improvement", key=f"accept_improve_{st.session_state.current_check_index}",
+                     use_container_width=True):
+            st.session_state.selected_checks[current_check['key']]['row']['SODACL Yaml Check Definition'] = \
+                st.session_state[f'ai_improved_{st.session_state.current_check_index}']
+            del st.session_state[f'ai_improved_{st.session_state.current_check_index}']
+            st.rerun()
+
+    # Show AI explanation
+    if st.session_state.get(f'ai_explanation_{st.session_state.current_check_index}'):
+        with st.expander("💡 AI Explanation", expanded=True):
+            st.markdown(st.session_state[f'ai_explanation_{st.session_state.current_check_index}'])
 
 st.divider()
 

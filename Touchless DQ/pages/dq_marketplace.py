@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import json
 
 # NOTE: No st.set_page_config() here — only allowed in main app file
 
@@ -96,6 +97,121 @@ with col3:
 with col4:
     dimensions = df['DQ Dimension'].nunique()
     st.metric("DQ Dimensions", dimensions)
+
+# ---------------------------------------------------------------------------
+# Helper — call Cortex LLM (dual-mode)
+# ---------------------------------------------------------------------------
+def call_cortex(prompt, model_name):
+    """Call Snowflake Cortex — supports both Snowpark session and connector."""
+    try:
+        escaped_prompt = prompt.replace("'", "''")
+        query = f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            '{model_name}',
+            '{escaped_prompt}'
+        ) AS response
+        """
+        if session is not None:
+            result = session.sql(query).collect()
+            return result[0]["RESPONSE"] if result else None
+        elif st.session_state.get("connection"):
+            cur = st.session_state.connection.cursor()
+            cur.execute(query)
+            result = cur.fetchone()
+            cur.close()
+            return result[0] if result else None
+        else:
+            st.error("Not connected to Snowflake.")
+            return None
+    except Exception as e:
+        st.error(f"LLM Error: {e}")
+        return None
+
+def parse_llm_json(raw):
+    """Best-effort extraction of a JSON object from a raw LLM response."""
+    cleaned = raw.strip()
+    if '```' in cleaned:
+        parts = cleaned.split('```')
+        if len(parts) >= 3:
+            cleaned = parts[1].replace('json', '', 1)
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start != -1 and end != -1:
+        cleaned = cleaned[start:end + 1]
+    return json.loads(cleaned)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# AI Quality Summary
+# ---------------------------------------------------------------------------
+if st.button("🤖 AI Quality Summary", key="ai_quality_summary", use_container_width=True):
+    with st.spinner("Cortex AI is analyzing your checks..."):
+        checks_info = []
+        for _, row in df.iterrows():
+            checks_info.append({
+                "cde": row["Critical Data Element"],
+                "domain": row["Domain"],
+                "dimension": row["DQ Dimension"],
+                "check_name": row["Check name"],
+                "description": row["Check Description"][:100]
+            })
+
+        summary_prompt = f"""You are a data quality expert. Provide a quality summary of these DQ checks.
+
+Checks:
+{json.dumps(checks_info, indent=2)}
+
+Analyze and provide:
+1. Overall quality assessment of the check suite
+2. Strengths — what's well-covered
+3. Weaknesses — what's missing or could be better
+4. Priority actions — top 3 things to improve
+5. Quality score (0-100)
+
+Respond ONLY with valid JSON:
+{{
+    "quality_score": 80,
+    "assessment": "Brief overall assessment...",
+    "strengths": ["strength1", "strength2"],
+    "weaknesses": ["weakness1", "weakness2"],
+    "priority_actions": ["action1", "action2", "action3"]
+}}
+
+Output only JSON, no markdown."""
+
+        response = call_cortex(summary_prompt, st.session_state.get('model', 'llama3.1-70b'))
+        if response:
+            try:
+                summary = parse_llm_json(response)
+                st.session_state.ai_quality_summary = summary
+            except Exception as e:
+                st.error(f"Failed to parse summary: {e}")
+                with st.expander("Raw response"):
+                    st.code(response)
+
+if st.session_state.get("ai_quality_summary"):
+    summary = st.session_state.ai_quality_summary
+    with st.expander("🤖 AI Quality Summary", expanded=True):
+        qs_col1, qs_col2 = st.columns([1, 3])
+        with qs_col1:
+            st.metric("Quality Score", f"{summary.get('quality_score', 0)}/100")
+        with qs_col2:
+            st.info(summary.get("assessment", ""))
+
+        qs_left, qs_right = st.columns(2)
+        with qs_left:
+            st.markdown("**Strengths:**")
+            for s in summary.get("strengths", []):
+                st.markdown(f"✅ {s}")
+        with qs_right:
+            st.markdown("**Weaknesses:**")
+            for w in summary.get("weaknesses", []):
+                st.markdown(f"⚠️ {w}")
+
+        st.markdown("**Priority Actions:**")
+        for i, action in enumerate(summary.get("priority_actions", []), 1):
+            st.markdown(f"**{i}.** {action}")
 
 st.divider()
 
