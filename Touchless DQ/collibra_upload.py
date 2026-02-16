@@ -29,15 +29,48 @@ st.title("📤 Upload Collibra Metadata & Catalog")
 IS_LOCAL = False
 
 def get_snowflake_session():
-    """Return a Snowpark session. Works in both SiS and local dev."""
+    """Return a Snowpark session. Works in both SiS and local dev.
+
+    In SiS: get_active_session() should always succeed.
+    Locally: the import fails with ImportError OR get_active_session()
+    raises error 1403 (no default session) if snowpark is installed
+    locally but no SiS runtime is present.
+    """
     global IS_LOCAL
     try:
         from snowflake.snowpark.context import get_active_session
         session = get_active_session()
         IS_LOCAL = False
         return session
-    except Exception:
+    except ImportError:
+        # snowflake.snowpark not installed -> local dev environment
         IS_LOCAL = True
+        return None
+    except Exception as e:
+        error_str = str(e)
+        if "1403" in error_str or "No default Session" in error_str:
+            # Snowpark is installed but no active SiS session exists.
+            # This happens when running locally with snowpark installed,
+            # or if the SiS app was not deployed via CREATE STREAMLIT.
+            # Fall back to local mode so the user can connect manually.
+            IS_LOCAL = True
+            st.warning(
+                "No active Snowflake session detected (snowpark is installed "
+                "but no SiS runtime found). Falling back to manual connection.\n\n"
+                "**If you are in Snowflake Streamlit:** ensure the app was "
+                "deployed via `CREATE STREAMLIT` and the warehouse is active.\n\n"
+                "**If you are running locally:** enter your credentials in the "
+                "sidebar to connect."
+            )
+            return None
+        # Any other unexpected error -- surface it
+        st.error(
+            f"Snowflake session error: {e}\n\n"
+            "This may be caused by a package version conflict in requirements.txt. "
+            "Ensure requirements.txt does not list streamlit, "
+            "snowflake-connector-python, or snowflake-snowpark-python."
+        )
+        IS_LOCAL = False
         return None
 
 def get_local_connection():
@@ -439,6 +472,37 @@ def load_table(table_name):
         raise Exception("Not connected to Snowflake.")
 
 
+# Expected column names for catalog and metadata DataFrames.
+# Used to normalise columns from any source (table or stage file).
+_CATALOG_COLUMNS = [
+    'Critical Data Element', 'Domain', 'DQ Dimension', 'Check name',
+    'Check Description', 'Short description of Critical Data Element',
+    'SODACL Yaml Check Definition',
+]
+_METADATA_COLUMNS = [
+    'Column name', 'Column description', 'Datatype',
+    'Related Fields (Min/Max/Sample Values)',
+]
+
+
+def _normalize_df_columns(df: pd.DataFrame, expected: list) -> pd.DataFrame:
+    """Map DataFrame columns to expected names via case-insensitive match.
+
+    Handles variations like underscores vs spaces
+    (e.g., CRITICAL_DATA_ELEMENT -> Critical Data Element).
+    """
+    col_map = {}
+    # Normalize key: lowercase, underscores to spaces, strip
+    lower_lookup = {e.lower().replace('_', ' ').strip(): e for e in expected}
+    for actual in df.columns:
+        key = actual.lower().replace('_', ' ').strip()
+        if key in lower_lookup and actual != lower_lookup[key]:
+            col_map[actual] = lower_lookup[key]
+    if col_map:
+        df = df.rename(columns=col_map)
+    return df
+
+
 def resolve_table_name(raw_name: str, context: dict) -> str:
     """Return a fully-qualified table name using the provided context."""
     cleaned = (raw_name or "").strip()
@@ -578,6 +642,77 @@ def list_tables_for_context(context: dict, cache_label: str) -> list:
     return st.session_state.get(cache_key, [])
 
 
+def list_stages_for_context(context: dict, cache_label: str) -> list:
+    """Return formatted stage entries for the provided database/schema.
+
+    Runs SHOW STAGES IN SCHEMA {db}.{schema} and returns a list of
+    dicts with 'value' and 'label' keys, suitable for st.selectbox.
+    Results are cached in session_state, keyed by cache_label + db + schema.
+    """
+    database = (context.get("database") or "").strip()
+    schema = (context.get("schema") or "").strip()
+    if not database or not schema:
+        return []
+
+    cache_key = f"_stages_{cache_label}_{database}_{schema}"
+    debug_key = f"_stages_debug_{cache_label}"
+    if cache_key not in st.session_state:
+        sql_query = f'SHOW STAGES IN SCHEMA {database}.{schema}'
+        st.session_state[debug_key] = {
+            "database": database,
+            "schema": schema,
+            "query": sql_query,
+            "status": "querying"
+        }
+        df = run_query_df(sql_query)
+
+        # Check if there was an error
+        query_error = st.session_state.get("_last_query_error")
+        if query_error:
+            st.session_state[debug_key]["status"] = "error"
+            st.session_state[debug_key]["error"] = query_error
+            st.session_state[debug_key]["row_count"] = 0
+            st.session_state[debug_key]["columns"] = []
+            st.session_state[cache_key] = []
+            return []
+
+        entries = []
+        if not df.empty and "name" in df.columns:
+            for _, row in df.iterrows():
+                name = row.get("name")
+                if not name:
+                    continue
+                # Build fully-qualified stage name for use in LIST @stage
+                fq_stage = f"{database}.{schema}.{name}"
+                comment = row.get("comment")
+                created = row.get("created_on") or row.get("created")
+                owner = row.get("owner")
+                label_parts = [name]
+                if comment:
+                    label_parts.append(str(comment))
+                elif created:
+                    try:
+                        ts = pd.to_datetime(created)
+                        label_parts.append(ts.strftime("%Y-%m-%d"))
+                    except Exception:
+                        label_parts.append(str(created))
+                if owner:
+                    label_parts.append(f"owner: {owner}")
+                entries.append({
+                    "value": fq_stage,
+                    "label": " \u2022 ".join(label_parts)
+                })
+            st.session_state[debug_key]["status"] = "success"
+            st.session_state[debug_key]["stage_count"] = len(entries)
+        else:
+            st.session_state[debug_key]["status"] = "empty"
+            st.session_state[debug_key]["columns"] = list(df.columns)
+            st.session_state[debug_key]["row_count"] = len(df)
+        st.session_state[cache_key] = entries
+
+    return st.session_state.get(cache_key, [])
+
+
 def load_stage_file(stage_reference: str) -> Optional[pd.DataFrame]:
     """Download a staged file to a temp directory and load it into pandas."""
     try:
@@ -623,70 +758,200 @@ if not st.session_state.connected:
 
 
 # ===========================================================================
-# Step 1 — Load DQ Checks Catalog (Stage only)
+# Step 1 — Load DQ Checks Catalog
 # ===========================================================================
 st.header("📘 Step 1: Load DQ Checks Catalog")
 
 catalog_context = st.session_state.catalog_context
-st.caption("Provide the stage that contains your catalog file.")
-cat_stage_col, cat_prefix_col = st.columns([2, 1])
-catalog_context["stage"] = cat_stage_col.text_input(
-    "Catalog Stage (DB.SCHEMA.STAGE)",
-    value=catalog_context.get("stage", ""),
-    key="catalog_stage_input",
-    placeholder="DEV_GDP_UTIL_DB.EXT_VOL.CATALOG_STAGE"
+
+# Context inputs (database + schema)
+st.caption("Catalog context — set the database and schema where your catalog lives.")
+cat_db_col, cat_schema_col = st.columns(2)
+catalog_context["database"] = cat_db_col.text_input(
+    "Catalog Database",
+    value=catalog_context.get("database", ""),
+    key="catalog_db_input"
 )
-catalog_context["stage_prefix"] = cat_prefix_col.text_input(
-    "Stage Folder (optional)",
-    value=catalog_context.get("stage_prefix", ""),
-    key="catalog_stage_prefix_input",
-    placeholder="folder/subfolder"
+catalog_context["schema"] = cat_schema_col.text_input(
+    "Catalog Schema",
+    value=catalog_context.get("schema", ""),
+    key="catalog_schema_input"
 )
 
-if not catalog_context.get("stage"):
-    st.warning("Provide a fully-qualified stage name (e.g., DEV_GDP_UTIL_DB.EXT_VOL.STAGE_NAME) to list files.")
+# Source toggle
+catalog_source = st.radio(
+    "Choose catalog source",
+    ["Snowflake Table", "Snowflake Stage (Excel/CSV)"],
+    horizontal=True,
+    key="catalog_source",
+    help="Load the DQ checks catalog from a Snowflake table or from an Excel/CSV file on a stage"
+)
+
+if catalog_source == "Snowflake Table":
+    # ---- TABLE PATH ----
+    catalog_table_entries = list_tables_for_context(catalog_context, "catalog")
+    selected_catalog_table = ""
+    cat_select_col, cat_refresh_col = st.columns([7, 1])
+    with cat_select_col:
+        if catalog_table_entries:
+            option_values = [entry["value"] for entry in catalog_table_entries]
+            label_map = {entry["value"]: entry["label"] for entry in catalog_table_entries}
+            selected_catalog_table = st.selectbox(
+                "Choose catalog table",
+                [""] + option_values,
+                key="catalog_table_select",
+                format_func=lambda val: label_map.get(val, "Select table..." if val == "" else val)
+            )
+        else:
+            st.info("No tables found for the provided catalog context.")
+    with cat_refresh_col:
+        st.write("\u200b")
+        if st.button("🔄", key="catalog_tables_refresh", help="Refresh table list"):
+            keys_to_clear = [k for k in list(st.session_state.keys())
+                             if k.startswith("_tables_catalog_") or k.startswith("_tables_debug_catalog")]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.rerun()
+
+    # Debug expander for table listing failures
+    debug_info = st.session_state.get("_tables_debug_catalog")
+    if debug_info and debug_info.get("status") in ["empty", "error"]:
+        is_error = debug_info.get("status") == "error"
+        with st.expander(f"🔍 Debug: {('Query failed' if is_error else 'no tables found')}", expanded=True):
+            st.code(debug_info.get('query', ''), language='sql')
+            st.write(f"**Database:** {debug_info.get('database')}")
+            st.write(f"**Schema:** {debug_info.get('schema')}")
+            if is_error:
+                st.error(f"**Error:** {debug_info.get('error', 'Unknown error')}")
+            else:
+                st.write(f"**Rows returned:** {debug_info.get('row_count', 0)}")
+            st.caption("Try running the SQL above in a Snowflake worksheet to verify.")
+
+    # Manual table name fallback
+    catalog_table = st.text_input(
+        "Or enter table name",
+        value=st.session_state.get("catalog_table_name", ""),
+        placeholder="DQ_CHECKS_CATALOG",
+        key="catalog_table_name_input"
+    )
+
+    if st.button("📥 Load Catalog", key="load_catalog_table_btn", type="primary"):
+        try:
+            table_choice = catalog_table.strip() or selected_catalog_table.strip()
+            if not table_choice:
+                raise ValueError("Select or enter a catalog table name.")
+            table_name = resolve_table_name(table_choice, catalog_context)
+            df = _normalize_df_columns(load_table(table_name), _CATALOG_COLUMNS)
+            st.session_state.catalog_df = df
+            st.session_state.catalog_table_name = table_choice
+            st.success(f"✅ Catalog loaded: **{len(df)}** checks")
+        except ValueError as ve:
+            st.error(str(ve))
+        except Exception as e:
+            st.error(f"Failed to load table: {e}")
+
 else:
-    try:
-        entries = list_stage_entries(
-            catalog_context.get("stage", ""),
-            catalog_context.get("stage_prefix", "")
-        )
-    except Exception as exc:
-        entries = []
-        st.error(f"Error listing stage: {exc}")
+    # ---- STAGE PATH (dynamic stage dropdown) ----
+    stage_entries = list_stages_for_context(catalog_context, "catalog")
+    cat_stage_select_col, cat_stage_refresh_col = st.columns([7, 1])
+    with cat_stage_select_col:
+        if stage_entries:
+            stage_option_values = [entry["value"] for entry in stage_entries]
+            stage_label_map = {entry["value"]: entry["label"] for entry in stage_entries}
+            selected_stage = st.selectbox(
+                "Choose stage",
+                [""] + stage_option_values,
+                key="catalog_stage_select",
+                format_func=lambda val: stage_label_map.get(val, "Select stage..." if val == "" else val)
+            )
+            catalog_context["stage"] = selected_stage
+        else:
+            st.info("No stages found. Enter a stage name manually below.")
+            selected_stage = ""
+    with cat_stage_refresh_col:
+        st.write("\u200b")
+        if st.button("🔄", key="catalog_stages_refresh", help="Refresh stage list"):
+            keys_to_clear = [k for k in list(st.session_state.keys())
+                             if k.startswith("_stages_catalog_") or k.startswith("_stages_debug_catalog")]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.rerun()
 
-    # Show debug info if no files found
-    stage_debug = st.session_state.get("_stage_list_debug")
-    if not entries and stage_debug:
-        with st.expander("🔍 Debug: stage listing returned no files", expanded=True):
-            st.code(stage_debug.get('query', ''), language='sql')
-            st.write(f"**Stage reference:** {stage_debug.get('reference')}")
-            st.write(f"**Rows returned:** {stage_debug.get('row_count', 0)}")
-            st.write(f"**Columns returned:** {', '.join(stage_debug.get('columns', []))}")
-            st.write(f"**Has 'name' column:** {stage_debug.get('has_name_column', False)}")
-            if stage_debug.get('row_count', 0) == 0:
-                st.info("✓ Query executed successfully but returned 0 files. The stage may be empty or the folder path may not exist.")
+    # Debug expander for stage listing failures
+    stages_debug = st.session_state.get("_stages_debug_catalog")
+    if stages_debug and stages_debug.get("status") in ["empty", "error"]:
+        is_error = stages_debug.get("status") == "error"
+        with st.expander(f"🔍 Debug: {('Query failed' if is_error else 'no stages found')}", expanded=True):
+            st.code(stages_debug.get('query', ''), language='sql')
+            st.write(f"**Database:** {stages_debug.get('database')}")
+            st.write(f"**Schema:** {stages_debug.get('schema')}")
+            if is_error:
+                st.error(f"**Error:** {stages_debug.get('error', 'Unknown error')}")
             else:
-                st.warning("Query returned rows but 'name' column was not found. This is unusual.")
-            st.caption("Try running the SQL above in a Snowflake worksheet to verify the stage exists and contains files.")
+                st.write(f"**Rows returned:** {stages_debug.get('row_count', 0)}")
+            st.caption("Try running the SQL above in a Snowflake worksheet to verify.")
 
-    if entries:
-        option_values = [entry["value"] for entry in entries]
-        label_map = {entry["value"]: entry["label"] for entry in entries}
-        selected_stage_file = st.selectbox(
-            "Select catalog file",
-            [""] + option_values,
-            format_func=lambda val: label_map.get(val, "Select file..." if val == "" else val),
-            key="catalog_stage_file_select"
-        )
-        if st.button("📥 Load Catalog", key="load_catalog_stage_btn", type="primary"):
-            if selected_stage_file:
-                df = load_stage_file(selected_stage_file)
-                if df is not None:
-                    st.session_state.catalog_df = df
-                    st.success(f"✅ Catalog loaded from stage: **{len(df)}** checks")
-            else:
-                st.warning("Choose a file from the dropdown first.")
+    # Manual stage override + prefix
+    cat_manual_stage_col, cat_prefix_col = st.columns([2, 1])
+    manual_stage = cat_manual_stage_col.text_input(
+        "Or enter stage name (DB.SCHEMA.STAGE)",
+        value="" if selected_stage else catalog_context.get("stage", ""),
+        key="catalog_stage_manual_input",
+        placeholder="DEV_GDP_UTIL_DB.EXT_VOL.CATALOG_STAGE"
+    )
+    catalog_context["stage_prefix"] = cat_prefix_col.text_input(
+        "Stage Folder (optional)",
+        value=catalog_context.get("stage_prefix", ""),
+        key="catalog_stage_prefix_input",
+        placeholder="folder/subfolder"
+    )
+
+    # Determine effective stage name: dropdown takes priority over manual
+    effective_stage = selected_stage or manual_stage.strip()
+    if effective_stage:
+        catalog_context["stage"] = effective_stage
+
+    if not effective_stage:
+        st.warning("Select a stage from the dropdown or enter a fully-qualified stage name.")
+    else:
+        try:
+            entries = list_stage_entries(
+                effective_stage,
+                catalog_context.get("stage_prefix", "")
+            )
+        except Exception as exc:
+            entries = []
+            st.error(f"Error listing stage: {exc}")
+
+        # Debug for empty file listing
+        stage_debug = st.session_state.get("_stage_list_debug")
+        if not entries and stage_debug:
+            with st.expander("🔍 Debug: stage listing returned no files", expanded=True):
+                st.code(stage_debug.get('query', ''), language='sql')
+                st.write(f"**Stage reference:** {stage_debug.get('reference')}")
+                st.write(f"**Rows returned:** {stage_debug.get('row_count', 0)}")
+                if stage_debug.get('row_count', 0) == 0:
+                    st.info("Query executed successfully but returned 0 files.")
+                st.caption("Try running the SQL above in a Snowflake worksheet.")
+
+        if entries:
+            option_values = [entry["value"] for entry in entries]
+            label_map = {entry["value"]: entry["label"] for entry in entries}
+            selected_stage_file = st.selectbox(
+                "Select catalog file",
+                [""] + option_values,
+                format_func=lambda val: label_map.get(val, "Select file..." if val == "" else val),
+                key="catalog_stage_file_select"
+            )
+            if st.button("📥 Load Catalog", key="load_catalog_stage_btn", type="primary"):
+                if selected_stage_file:
+                    df = load_stage_file(selected_stage_file)
+                    if df is not None:
+                        df = _normalize_df_columns(df, _CATALOG_COLUMNS)
+                        st.session_state.catalog_df = df
+                        st.success(f"✅ Catalog loaded from stage: **{len(df)}** checks")
+                else:
+                    st.warning("Choose a file from the dropdown first.")
 
 if st.session_state.catalog_df is not None:
     with st.expander(f"📋 View Catalog ({len(st.session_state.catalog_df)} rows)", expanded=False):
@@ -735,20 +1000,6 @@ metadata_context["schema"] = meta_schema_col.text_input(
     value=metadata_context.get("schema", ""),
     key="metadata_schema_input"
 )
-meta_stage_col, meta_prefix_col = st.columns([2, 1])
-metadata_context["stage"] = meta_stage_col.text_input(
-    "Metadata Stage (DB.SCHEMA.STAGE)",
-    value=metadata_context.get("stage", ""),
-    key="metadata_stage_input",
-    placeholder="DEV_GDP_UTIL_DB.EXT_VOL.METADATA_STAGE"
-)
-metadata_context["stage_prefix"] = meta_prefix_col.text_input(
-    "Stage Folder (optional)",
-    value=metadata_context.get("stage_prefix", ""),
-    key="metadata_stage_prefix_input",
-    placeholder="folder/subfolder"
-)
-
 metadata_source = st.radio(
     "Choose metadata source",
     ["Snowflake Table", "Snowflake Stage (Excel/CSV)"],
@@ -820,7 +1071,7 @@ if metadata_source == "Snowflake Table":
             if not table_choice:
                 raise ValueError("Select or enter a metadata table name.")
             table_name = resolve_table_name(table_choice, metadata_context)
-            metadata_df = load_table(table_name)
+            metadata_df = _normalize_df_columns(load_table(table_name), _METADATA_COLUMNS)
             st.session_state.collibra_metadata = metadata_df
             st.session_state.metadata_table_name = table_choice
             st.success(f"✅ Metadata loaded: **{len(metadata_df)}** columns")
@@ -829,13 +1080,78 @@ if metadata_source == "Snowflake Table":
         except Exception as e:
             st.error(f"Failed to load table: {e}")
 else:
-    if not metadata_context.get("stage"):
-        st.warning("Provide a fully-qualified stage name to list files.")
+    # ---- STAGE PATH (dynamic stage dropdown) ----
+    stage_entries = list_stages_for_context(metadata_context, "metadata")
+    meta_stage_select_col, meta_stage_refresh_col = st.columns([7, 1])
+    with meta_stage_select_col:
+        if stage_entries:
+            stage_option_values = [entry["value"] for entry in stage_entries]
+            stage_label_map = {entry["value"]: entry["label"] for entry in stage_entries}
+            selected_meta_stage = st.selectbox(
+                "Choose stage",
+                [""] + stage_option_values,
+                key="metadata_stage_select",
+                format_func=lambda val: stage_label_map.get(val, "Select stage..." if val == "" else val)
+            )
+            metadata_context["stage"] = selected_meta_stage
+        else:
+            st.info("No stages found. Enter a stage name manually below.")
+            selected_meta_stage = ""
+    with meta_stage_refresh_col:
+        st.write("\u200b")
+        if st.button("🔄", key="metadata_stages_refresh", help="Refresh stage list"):
+            keys_to_clear = [k for k in list(st.session_state.keys())
+                             if k.startswith("_stages_metadata_") or k.startswith("_stages_debug_metadata")]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.rerun()
+
+    # Debug expander for stage listing failures
+    stages_debug = st.session_state.get("_stages_debug_metadata")
+    if stages_debug and stages_debug.get("status") in ["empty", "error"]:
+        is_error = stages_debug.get("status") == "error"
+        with st.expander(f"🔍 Debug: {('Query failed' if is_error else 'no stages found')}", expanded=True):
+            st.code(stages_debug.get('query', ''), language='sql')
+            st.write(f"**Database:** {stages_debug.get('database')}")
+            st.write(f"**Schema:** {stages_debug.get('schema')}")
+            if is_error:
+                st.error(f"**Error:** {stages_debug.get('error', 'Unknown error')}")
+            else:
+                st.write(f"**Rows returned:** {stages_debug.get('row_count', 0)}")
+            st.caption("Try running the SQL above in a Snowflake worksheet to verify.")
+
+    # Manual stage override + prefix
+    meta_manual_stage_col, meta_prefix_col = st.columns([2, 1])
+    manual_meta_stage = meta_manual_stage_col.text_input(
+        "Or enter stage name (DB.SCHEMA.STAGE)",
+        value="" if selected_meta_stage else metadata_context.get("stage", ""),
+        key="metadata_stage_manual_input",
+        placeholder="DEV_GDP_UTIL_DB.EXT_VOL.METADATA_STAGE"
+    )
+    metadata_context["stage_prefix"] = meta_prefix_col.text_input(
+        "Stage Folder (optional)",
+        value=metadata_context.get("stage_prefix", ""),
+        key="metadata_stage_prefix_input",
+        placeholder="folder/subfolder"
+    )
+
+    # Determine effective stage name: dropdown takes priority over manual
+    effective_meta_stage = selected_meta_stage or manual_meta_stage.strip()
+    if effective_meta_stage:
+        metadata_context["stage"] = effective_meta_stage
+
+    if not effective_meta_stage:
+        st.warning("Select a stage from the dropdown or enter a fully-qualified stage name.")
     else:
-        entries = list_stage_entries(
-            metadata_context.get("stage", ""),
-            metadata_context.get("stage_prefix", "")
-        )
+        try:
+            entries = list_stage_entries(
+                effective_meta_stage,
+                metadata_context.get("stage_prefix", "")
+            )
+        except Exception as exc:
+            entries = []
+            st.error(f"Error listing stage: {exc}")
+
         if entries:
             option_values = [entry["value"] for entry in entries]
             label_map = {entry["value"]: entry["label"] for entry in entries}
@@ -849,6 +1165,7 @@ else:
                 if selected_metadata_stage_file:
                     df = load_stage_file(selected_metadata_stage_file)
                     if df is not None:
+                        df = _normalize_df_columns(df, _METADATA_COLUMNS)
                         st.session_state.collibra_metadata = df
                         st.success(f"✅ Metadata loaded from stage: **{len(df)}** columns")
                 else:
@@ -996,8 +1313,20 @@ Output only JSON, no markdown."""
 if st.session_state.collibra_metadata is not None and st.session_state.catalog_df is not None:
     st.header("Step 3: AI-Powered Matching")
 
-    metadata_df = st.session_state.collibra_metadata
-    catalog_df = st.session_state.catalog_df
+    metadata_df = _normalize_df_columns(st.session_state.collibra_metadata, _METADATA_COLUMNS)
+    catalog_df = _normalize_df_columns(st.session_state.catalog_df, _CATALOG_COLUMNS)
+
+    # Validate required columns exist
+    _missing_cat = [c for c in ['Critical Data Element', 'Domain'] if c not in catalog_df.columns]
+    _missing_meta = [c for c in ['Column name'] if c not in metadata_df.columns]
+    if _missing_cat or _missing_meta:
+        if _missing_cat:
+            st.error(f"Catalog is missing columns: {_missing_cat}. "
+                     f"Available columns: {list(catalog_df.columns)}")
+        if _missing_meta:
+            st.error(f"Metadata is missing columns: {_missing_meta}. "
+                     f"Available columns: {list(metadata_df.columns)}")
+        st.stop()
 
     if st.button("🧠 Match Metadata to Catalog", type="primary", use_container_width=True):
         with st.spinner("AI is analyzing and matching..."):

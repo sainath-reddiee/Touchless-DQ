@@ -24,8 +24,13 @@ session = None
 try:
     from snowflake.snowpark.context import get_active_session
     session = get_active_session()
-except Exception:
+except ImportError:
     IS_LOCAL = True
+except Exception as e:
+    if "1403" in str(e) or "No default Session" in str(e):
+        IS_LOCAL = True
+    else:
+        st.error(f"Snowflake session error: {e}")
 
 # Initialize session state
 if "selected_checks" not in st.session_state:
