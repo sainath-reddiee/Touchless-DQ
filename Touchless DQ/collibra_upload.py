@@ -176,7 +176,18 @@ def run_query_df(query):
     """Execute a SQL query and return results as a pandas DataFrame."""
     try:
         if session is not None:
-            df = session.sql(query).to_pandas()
+            # SiS: try to_pandas() first, fall back to collect()
+            try:
+                df = session.sql(query).to_pandas()
+            except Exception:
+                # Fallback: use collect() and build DataFrame manually
+                rows = session.sql(query).collect()
+                if rows:
+                    cols = list(rows[0].asDict().keys())
+                    data = [list(r.asDict().values()) for r in rows]
+                    df = pd.DataFrame(data, columns=cols)
+                else:
+                    df = pd.DataFrame()
         elif st.session_state.get("connection"):
             cur = st.session_state.connection.cursor()
             cur.execute(query)
@@ -198,7 +209,18 @@ def get_cached_list(cache_key, query, column_name):
     """Fetch and cache a list of values from a SQL query."""
     if cache_key not in st.session_state:
         df = run_query_df(query)
-        st.session_state[cache_key] = sorted(df[column_name].tolist()) if column_name in df.columns else []
+        col = column_name.lower()
+        if col in df.columns:
+            st.session_state[cache_key] = sorted(
+                df[col].dropna().astype(str).unique().tolist()
+            )
+        elif len(df.columns) > 0:
+            # Fallback: use the first column if exact name not found
+            st.session_state[cache_key] = sorted(
+                df.iloc[:, 0].dropna().astype(str).unique().tolist()
+            )
+        else:
+            st.session_state[cache_key] = []
     return st.session_state[cache_key]
 
 
@@ -576,65 +598,45 @@ if not st.session_state.connected:
 
 
 # ===========================================================================
-# Step 1 — Load DQ Checks Catalog
+# Step 1 — Load DQ Checks Catalog  (Excel / CSV from Stage only)
 # ===========================================================================
-st.header("Step 1: Load DQ Checks Catalog")
+st.header("📘 Step 1: Load DQ Checks Catalog")
+st.caption("Upload your DQ rules catalog from a Snowflake Stage (Excel or CSV)")
 
-catalog_source = st.radio(
-    "Choose catalog source",
-    ["Snowflake Table", "Snowflake Stage (Excel/CSV)"],
-    horizontal=True,
-    key="catalog_source"
+cat_stage, cat_file = stage_file_picker(
+    "catalog", file_types=[".xlsx", ".xls", ".csv", ".csv.gz"]
 )
 
-if catalog_source == "Snowflake Table":
-    st.caption("Browse and select a table from your Snowflake account")
-    selected_catalog_table = snowflake_table_picker("catalog")
-
-    if st.button("📥 Load Catalog", key="load_catalog_btn"):
-        if selected_catalog_table:
-            try:
-                with st.spinner("Loading catalog..."):
-                    catalog_df = load_table(selected_catalog_table)
+if st.button("📥 Load Catalog", key="load_catalog_stage_btn", type="primary"):
+    if cat_stage and cat_file:
+        try:
+            with st.spinner(f"Loading from @{cat_stage}..."):
+                catalog_df = _read_stage_file(cat_stage, cat_file)
+                if catalog_df is not None:
                     st.session_state.catalog_df = catalog_df
-                    st.success(f"✅ Catalog loaded: {len(catalog_df)} checks")
-            except Exception as e:
-                st.error(f"Failed to load table: {e}")
-        else:
-            st.warning("Please select a database, schema, and table first")
-else:
-    st.caption("Select a stage and pick an Excel/CSV file")
-    cat_stage, cat_file = stage_file_picker("catalog", file_types=[".xlsx", ".xls", ".csv", ".csv.gz"])
-
-    if st.button("📥 Load from Stage", key="load_catalog_stage_btn"):
-        if cat_stage and cat_file:
-            try:
-                with st.spinner(f"Downloading from @{cat_stage}..."):
-                    catalog_df = _read_stage_file(cat_stage, cat_file)
-                    if catalog_df is not None:
-                        st.session_state.catalog_df = catalog_df
-                        st.success(f"✅ Catalog loaded: {len(catalog_df)} checks")
-            except Exception as e:
-                st.error(f"Failed to load file: {e}")
-        else:
-            st.warning("Please select a stage and file first")
+                    st.success(f"✅ Catalog loaded: **{len(catalog_df)}** checks")
+        except Exception as e:
+            st.error(f"Failed to load file: {e}")
+    else:
+        st.warning("Please select a stage and file first")
 
 if st.session_state.catalog_df is not None:
-    with st.expander("📋 View Catalog"):
+    with st.expander(f"📋 View Catalog ({len(st.session_state.catalog_df)} rows)", expanded=False):
         st.dataframe(st.session_state.catalog_df, use_container_width=True)
 
 st.divider()
 
 # ===========================================================================
-# Step 2 — Load Collibra Metadata
+# Step 2 — Load Collibra Metadata  (Snowflake Table or Stage)
 # ===========================================================================
-st.header("Step 2: Load Collibra Metadata")
+st.header("📗 Step 2: Load Collibra Metadata")
 
 metadata_source = st.radio(
     "Choose metadata source",
     ["Snowflake Table", "Snowflake Stage (Excel/CSV)"],
     horizontal=True,
-    key="metadata_source"
+    key="metadata_source",
+    help="Load metadata from a Snowflake table or from an Excel/CSV file on a stage"
 )
 
 metadata_df = None
@@ -642,29 +644,31 @@ if metadata_source == "Snowflake Table":
     st.caption("Browse and select a table from your Snowflake account")
     selected_metadata_table = snowflake_table_picker("metadata")
 
-    if st.button("📥 Load Metadata", key="load_metadata_btn"):
+    if st.button("📥 Load Metadata", key="load_metadata_btn", type="primary"):
         if selected_metadata_table:
             try:
                 with st.spinner("Loading metadata..."):
                     metadata_df = load_table(selected_metadata_table)
                     st.session_state.collibra_metadata = metadata_df
-                    st.success(f"✅ Metadata loaded: {len(metadata_df)} columns")
+                    st.success(f"✅ Metadata loaded: **{len(metadata_df)}** columns")
             except Exception as e:
                 st.error(f"Failed to load table: {e}")
         else:
             st.warning("Please select a database, schema, and table first")
 else:
     st.caption("Select a stage and pick an Excel/CSV file")
-    meta_stage, meta_file = stage_file_picker("metadata", file_types=[".xlsx", ".xls", ".csv", ".csv.gz"])
+    meta_stage, meta_file = stage_file_picker(
+        "metadata", file_types=[".xlsx", ".xls", ".csv", ".csv.gz"]
+    )
 
-    if st.button("📥 Load from Stage", key="load_metadata_stage_btn"):
+    if st.button("📥 Load from Stage", key="load_metadata_stage_btn", type="primary"):
         if meta_stage and meta_file:
             try:
-                with st.spinner(f"Downloading from @{meta_stage}..."):
+                with st.spinner(f"Loading from @{meta_stage}..."):
                     metadata_df = _read_stage_file(meta_stage, meta_file)
                     if metadata_df is not None:
                         st.session_state.collibra_metadata = metadata_df
-                        st.success(f"✅ Metadata loaded: {len(metadata_df)} columns")
+                        st.success(f"✅ Metadata loaded: **{len(metadata_df)}** columns")
             except Exception as e:
                 st.error(f"Failed to load file: {e}")
         else:
@@ -673,7 +677,7 @@ else:
 # Use whatever is in session state
 if st.session_state.collibra_metadata is not None:
     metadata_df = st.session_state.collibra_metadata
-    with st.expander("📋 View Metadata"):
+    with st.expander(f"📋 View Metadata ({len(metadata_df)} rows)", expanded=False):
         st.dataframe(metadata_df, use_container_width=True)
 
 st.divider()
