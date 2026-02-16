@@ -67,78 +67,118 @@ if "catalog_df" not in st.session_state:
 if "generated_checks" not in st.session_state:
     st.session_state.generated_checks = None
 
+# Pre-populate context from SiS session if available
 if session is not None:
     st.session_state.connected = True
     st.session_state.session = session
+    # Read current context from the active session (only once)
+    if "ctx_initialized" not in st.session_state:
+        try:
+            st.session_state.setdefault("sf_account", session.sql("SELECT CURRENT_ACCOUNT()").collect()[0][0] or "")
+            st.session_state.setdefault("sf_user", session.sql("SELECT CURRENT_USER()").collect()[0][0] or "")
+            st.session_state.setdefault("sf_role", session.sql("SELECT CURRENT_ROLE()").collect()[0][0] or "")
+            st.session_state.setdefault("sf_warehouse", session.sql("SELECT CURRENT_WAREHOUSE()").collect()[0][0] or "")
+            st.session_state.setdefault("sf_database", session.sql("SELECT CURRENT_DATABASE()").collect()[0][0] or "")
+            st.session_state.setdefault("sf_schema", session.sql("SELECT CURRENT_SCHEMA()").collect()[0][0] or "")
+        except Exception:
+            pass
+        st.session_state.ctx_initialized = True
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar — Snowflake Connection (unified for SiS + Local)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    if IS_LOCAL:
-        st.header("⚙️ Snowflake Connection")
+    st.header("🔌 Snowflake Connection")
 
-        if not st.session_state.connected:
-            # ---- Connection form: all fields up front ----
-            st.session_state["sf_account"] = st.text_input(
-                "Account Identifier *",
-                value=st.session_state.get("sf_account", ""),
-                placeholder="xy12345.us-east-1"
-            )
-            st.session_state["sf_user"] = st.text_input(
-                "Username *",
-                value=st.session_state.get("sf_user", ""),
-                placeholder="your_username"
-            )
-            st.caption("🔑 Authentication: SSO (browser will open)")
-            st.session_state["sf_role"] = st.text_input(
-                "Role",
-                value=st.session_state.get("sf_role", ""),
-                placeholder="SYSADMIN"
-            )
-            st.session_state["sf_warehouse"] = st.text_input(
-                "Warehouse",
-                value=st.session_state.get("sf_warehouse", ""),
-                placeholder="COMPUTE_WH"
-            )
-            st.session_state["sf_database"] = st.text_input(
-                "Database",
-                value=st.session_state.get("sf_database", ""),
-                placeholder="MY_DATABASE"
-            )
-            st.session_state["sf_schema"] = st.text_input(
-                "Schema",
-                value=st.session_state.get("sf_schema", ""),
-                placeholder="PUBLIC"
-            )
+    if session is not None:
+        st.success("✅ Connected natively to Snowflake")
+    elif st.session_state.connected:
+        st.success("✅ Connected to Snowflake")
+    else:
+        st.info("Enter credentials and connect")
 
-            if st.button("🔐 Connect", use_container_width=True, type="primary"):
-                if not st.session_state.sf_account or not st.session_state.sf_user:
-                    st.error("Account and Username are required")
-                else:
-                    try:
-                        with st.spinner("Connecting to Snowflake..."):
-                            conn = get_local_connection()
-                            st.session_state.connection = conn
-                            st.session_state.connected = True
-                            st.experimental_rerun()
-                    except Exception as e:
-                        st.error(f"Connection failed: {e}")
-        else:
-            # ---- Connected: show summary ----
-            st.success("✅ Connected to Snowflake")
-            st.caption(f"**Account:** {st.session_state.get('sf_account', '')}")
-            st.caption(f"**User:** {st.session_state.get('sf_user', '')}")
-            if st.session_state.get("sf_role"):
-                st.caption(f"**Role:** {st.session_state.sf_role}")
-            if st.session_state.get("sf_warehouse"):
-                st.caption(f"**Warehouse:** {st.session_state.sf_warehouse}")
-            if st.session_state.get("sf_database"):
-                st.caption(f"**Database:** {st.session_state.sf_database}")
-            if st.session_state.get("sf_schema"):
-                st.caption(f"**Schema:** {st.session_state.sf_schema}")
+    # Context text inputs — always visible
+    st.session_state["sf_account"] = st.text_input(
+        "🏢 Account",
+        value=st.session_state.get("sf_account", ""),
+        placeholder="xy12345.us-east-1"
+    )
+    st.session_state["sf_user"] = st.text_input(
+        "👤 User",
+        value=st.session_state.get("sf_user", ""),
+        placeholder="your_username"
+    )
+    st.session_state["sf_role"] = st.text_input(
+        "🎭 Role",
+        value=st.session_state.get("sf_role", ""),
+        placeholder="PUBLIC"
+    )
+    st.session_state["sf_warehouse"] = st.text_input(
+        "🏭 Warehouse",
+        value=st.session_state.get("sf_warehouse", ""),
+        placeholder="COMPUTE_WH"
+    )
+    st.session_state["sf_database"] = st.text_input(
+        "🗄️ Database",
+        value=st.session_state.get("sf_database", ""),
+        placeholder="MY_DATABASE"
+    )
+    st.session_state["sf_schema"] = st.text_input(
+        "📂 Source Schema",
+        value=st.session_state.get("sf_schema", ""),
+        placeholder="PUBLIC"
+    )
 
+    # Test Connection / Connect button
+    if IS_LOCAL and not st.session_state.connected:
+        if st.button("🔐 Connect (SSO)", use_container_width=True, type="primary"):
+            if not st.session_state.sf_account or not st.session_state.sf_user:
+                st.error("Account and User are required")
+            else:
+                try:
+                    with st.spinner("Connecting via SSO..."):
+                        conn = get_local_connection()
+                        st.session_state.connection = conn
+                        st.session_state.connected = True
+                        st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Connection failed: {e}")
+    else:
+        if st.button("⚡ Test Connection", use_container_width=True):
+            try:
+                # Apply context changes via USE commands
+                ctx_cmds = []
+                if st.session_state.get("sf_role"):
+                    ctx_cmds.append(f'USE ROLE "{st.session_state.sf_role}"')
+                if st.session_state.get("sf_warehouse"):
+                    ctx_cmds.append(f'USE WAREHOUSE "{st.session_state.sf_warehouse}"')
+                if st.session_state.get("sf_database"):
+                    ctx_cmds.append(f'USE DATABASE "{st.session_state.sf_database}"')
+                if st.session_state.get("sf_schema"):
+                    ctx_cmds.append(f'USE SCHEMA "{st.session_state.sf_database}"."{st.session_state.sf_schema}"')
+
+                for cmd in ctx_cmds:
+                    if session is not None:
+                        session.sql(cmd).collect()
+                    elif st.session_state.get("connection"):
+                        cur = st.session_state.connection.cursor()
+                        cur.execute(cmd)
+                        cur.close()
+
+                # Validate with SELECT 1
+                if session is not None:
+                    session.sql("SELECT 1").collect()
+                elif st.session_state.get("connection"):
+                    cur = st.session_state.connection.cursor()
+                    cur.execute("SELECT 1")
+                    cur.close()
+
+                st.success("✅ Connection OK!")
+            except Exception as e:
+                st.error(f"Connection test failed: {e}")
+
+        if IS_LOCAL and st.session_state.connected:
             if st.button("🔌 Disconnect", use_container_width=True):
                 try:
                     conn = st.session_state.get("connection")
@@ -149,13 +189,7 @@ with st.sidebar:
                 st.session_state.clear()
                 st.experimental_rerun()
 
-        st.divider()
-    else:
-        # ============================================================
-        # SiS MODE — auto-connected
-        # ============================================================
-        st.success("✅ Connected to Snowflake (SiS)")
-        st.divider()
+    st.divider()
 
     st.header("🤖 Model Settings")
     model = st.selectbox(
@@ -225,65 +259,56 @@ def get_cached_list(cache_key, query, column_name):
 
 
 # ---------------------------------------------------------------------------
-# Helper — cascading Database → Schema → Table picker
+# Helper — Table picker (uses sidebar Database + Schema context)
 # ---------------------------------------------------------------------------
 def snowflake_table_picker(prefix):
-    """Render cascading Database / Schema / Table dropdowns.
+    """Render a table picker using the sidebar Database/Schema context.
     Returns a fully-qualified table name like "DB"."SCHEMA"."TABLE", or None.
     """
-    # Shared data caches (so both pickers benefit from the same fetch)
-    databases = get_cached_list("_sf_databases", "SHOW DATABASES", "name")
+    ctx_db = st.session_state.get("sf_database", "")
+    ctx_schema = st.session_state.get("sf_schema", "")
 
-    col_db, col_schema, col_table, col_refresh = st.columns([3, 3, 3, 1])
+    if not ctx_db or not ctx_schema:
+        st.warning("⚠️ Set **Database** and **Source Schema** in the sidebar first")
+        return None
 
-    with col_db:
-        selected_db = st.selectbox(
-            "Database", [""] + databases, key=f"{prefix}_db",
-            format_func=lambda x: x if x else "Select database..."
-        )
+    st.caption(f'📌 Browse Context: `"{ctx_db}"."{ctx_schema}"` (from sidebar connection)')
 
-    # Fetch schemas when a database is selected
-    schemas = []
-    if selected_db:
-        schemas = get_cached_list(
-            f"_sf_schemas_{selected_db}",
-            f'SHOW SCHEMAS IN DATABASE "{selected_db}"',
-            "name"
-        )
+    # Fetch tables in the context schema
+    tables = get_cached_list(
+        f"_sf_tables_{ctx_db}_{ctx_schema}",
+        f'SHOW TABLES IN SCHEMA "{ctx_db}"."{ctx_schema}"',
+        "name"
+    )
 
-    with col_schema:
-        selected_schema = st.selectbox(
-            "Schema", [""] + schemas, key=f"{prefix}_schema",
-            format_func=lambda x: x if x else "Select schema..."
-        )
-
-    # Fetch tables when a schema is selected
-    tables = []
-    if selected_db and selected_schema:
-        tables = get_cached_list(
-            f"_sf_tables_{selected_db}_{selected_schema}",
-            f'SHOW TABLES IN SCHEMA "{selected_db}"."{selected_schema}"',
-            "name"
-        )
+    col_table, col_refresh = st.columns([8, 1])
 
     with col_table:
-        selected_table = st.selectbox(
-            "Table", [""] + tables, key=f"{prefix}_table",
-            format_func=lambda x: x if x else "Select table..."
-        )
+        if tables:
+            selected_table = st.selectbox(
+                "Choose Source tables",
+                [""] + tables, key=f"{prefix}_table",
+                format_func=lambda x: x if x else "No options to select..."
+            )
+        else:
+            selected_table = st.text_input(
+                "Table Name",
+                key=f"{prefix}_table_input",
+                placeholder="Enter table name..."
+            )
 
     with col_refresh:
-        st.write("")  # spacer to align with selectbox labels
+        st.write("")  # spacer
         st.write("")
-        if st.button("🔄", key=f"{prefix}_refresh", help="Refresh database/schema/table lists"):
+        if st.button("🔄", key=f"{prefix}_refresh", help="Refresh table list"):
             keys_to_clear = [k for k in list(st.session_state.keys())
-                            if k.startswith("_sf_")]
+                            if k.startswith("_sf_tables_")]
             for k in keys_to_clear:
                 del st.session_state[k]
             st.experimental_rerun()
 
-    if selected_db and selected_schema and selected_table:
-        return f'"{selected_db}"."{selected_schema}"."{selected_table}"'
+    if selected_table:
+        return f'"{ctx_db}"."{ctx_schema}"."{selected_table}"'
     return None
 
 
@@ -431,65 +456,15 @@ def load_table(table_name):
 # ---------------------------------------------------------------------------
 import tempfile, os
 
-def _list_stages():
-    """List available stages in the current schema."""
-    try:
-        conn = st.session_state.get("connection")
-        if conn:
-            cur = conn.cursor()
-            cur.execute("SHOW STAGES")
-            cols = [d[0].lower() for d in cur.description]
-            rows = cur.fetchall()
-            cur.close()
-            idx = cols.index("name") if "name" in cols else 0
-            return sorted(set(r[idx] for r in rows if r[idx]))
-        elif session is not None:
-            df = session.sql("SHOW STAGES").to_pandas()
-            df.columns = [c.lower() for c in df.columns]
-            return sorted(df["name"].dropna().unique().tolist())
-    except Exception:
-        pass
-    return []
-
-
-def _list_stage_files(stage_name):
-    """List files in a Snowflake stage. Returns list of file paths."""
-    try:
-        query = f'LIST @"{stage_name}"'
-        conn = st.session_state.get("connection")
-        if conn:
-            cur = conn.cursor()
-            cur.execute(query)
-            cols = [d[0].lower() for d in cur.description]
-            rows = cur.fetchall()
-            cur.close()
-            idx = cols.index("name") if "name" in cols else 0
-            return [r[idx] for r in rows if r[idx]]
-        elif session is not None:
-            df = session.sql(query).to_pandas()
-            df.columns = [c.lower() for c in df.columns]
-            return df["name"].dropna().tolist()
-    except Exception as e:
-        st.error(f"Failed to list stage files: {e}")
-    return []
-
-
-def _read_stage_file(stage_name, file_path):
-    """Download a file from a Snowflake stage and read it as a DataFrame."""
+def _read_stage_file(fq_stage, file_name):
+    """Download a file from a fully-qualified Snowflake stage and read as DataFrame.
+    fq_stage: e.g. "DB"."SCHEMA"."STAGE_NAME"
+    file_name: e.g. my_catalog.xlsx
+    """
     tmp_dir = tempfile.mkdtemp()
-    file_name = file_path.split("/")[-1]
-    local_path = os.path.join(tmp_dir, file_name)
 
     try:
-        # Build the GET command
-        # file_path from LIST is like: stage_name/filename.xlsx
-        # We need: @"STAGE_NAME"/filename.xlsx
-        if file_path.startswith(stage_name):
-            relative_path = file_path[len(stage_name):].lstrip("/")
-        else:
-            relative_path = file_path
-
-        get_query = f'GET @"{stage_name}/{relative_path}" file://{tmp_dir}/'
+        get_query = f'GET @{fq_stage}/{file_name} file://{tmp_dir}/'
 
         conn = st.session_state.get("connection")
         if conn:
@@ -517,14 +492,12 @@ def _read_stage_file(stage_name, file_path):
         elif fname.endswith(".parquet"):
             return pd.read_parquet(downloaded)
         else:
-            # Try CSV as default
             return pd.read_csv(downloaded)
 
     except Exception as e:
         st.error(f"Failed to read file from stage: {e}")
         return None
     finally:
-        # Cleanup temp files
         try:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -533,59 +506,45 @@ def _read_stage_file(stage_name, file_path):
 
 
 def stage_file_picker(prefix, file_types=None):
-    """Render a Stage → File picker UI. Returns (stage_name, file_path) or (None, None)."""
-    # Cache stages
-    cache_key = "_sf_stages"
-    if cache_key not in st.session_state:
-        st.session_state[cache_key] = _list_stages()
-    stages = st.session_state[cache_key]
+    """Render text-input-based Stage file picker.
+    Returns (fully_qualified_stage, file_name) or (None, None).
+    Stage DB/Schema default to sidebar context but can be overridden.
+    """
+    col_db, col_schema = st.columns(2)
+    with col_db:
+        stage_db = st.text_input(
+            "Stage Database",
+            value=st.session_state.get(f"{prefix}_stage_db",
+                  st.session_state.get("sf_database", "")),
+            key=f"{prefix}_stage_db",
+            placeholder="MY_DATABASE"
+        )
+    with col_schema:
+        stage_schema = st.text_input(
+            "Stage Schema",
+            value=st.session_state.get(f"{prefix}_stage_schema",
+                  st.session_state.get("sf_schema", "")),
+            key=f"{prefix}_stage_schema",
+            placeholder="PUBLIC"
+        )
 
-    col_stage, col_file, col_refresh = st.columns([3, 5, 1])
-
+    col_stage, col_file = st.columns(2)
     with col_stage:
-        selected_stage = st.selectbox(
-            "Stage",
-            [""] + stages,
-            key=f"{prefix}_stage",
-            format_func=lambda x: x if x else "Select stage..."
+        stage_name = st.text_input(
+            "Stage Name",
+            key=f"{prefix}_stage_name",
+            placeholder="MY_STAGE"
         )
-
-    # List files when stage is selected
-    files = []
-    if selected_stage:
-        files_cache_key = f"_sf_stage_files_{selected_stage}"
-        if files_cache_key not in st.session_state:
-            st.session_state[files_cache_key] = _list_stage_files(selected_stage)
-        files = st.session_state[files_cache_key]
-
-        # Filter by file type if specified
-        if file_types and files:
-            files = [f for f in files
-                     if any(f.lower().endswith(ext) for ext in file_types)]
-
     with col_file:
-        # Show just filenames for readability
-        display_files = [f.split("/")[-1] for f in files]
-        file_map = dict(zip(display_files, files))
-
-        selected_display = st.selectbox(
-            "File",
-            [""] + display_files,
-            key=f"{prefix}_stage_file",
-            format_func=lambda x: x if x else "Select file..."
+        file_name = st.text_input(
+            "File Name",
+            key=f"{prefix}_file_name",
+            placeholder="dq_catalog.xlsx"
         )
 
-    with col_refresh:
-        st.write("")  # spacer
-        st.write("")
-        if st.button("🔄", key=f"{prefix}_stage_refresh", help="Refresh stage/file lists"):
-            for k in list(st.session_state.keys()):
-                if k.startswith("_sf_stage"):
-                    del st.session_state[k]
-            st.experimental_rerun()
-
-    if selected_stage and selected_display:
-        return selected_stage, file_map[selected_display]
+    if stage_db and stage_schema and stage_name and file_name:
+        fq_stage = f'"{stage_db}"."{stage_schema}"."{stage_name}"'
+        return fq_stage, file_name
     return None, None
 
 
@@ -618,7 +577,7 @@ if st.button("📥 Load Catalog", key="load_catalog_stage_btn", type="primary"):
         except Exception as e:
             st.error(f"Failed to load file: {e}")
     else:
-        st.warning("Please select a stage and file first")
+        st.warning("Please fill in Stage Database, Schema, Stage Name, and File Name")
 
 if st.session_state.catalog_df is not None:
     with st.expander(f"📋 View Catalog ({len(st.session_state.catalog_df)} rows)", expanded=False):
@@ -654,7 +613,7 @@ if metadata_source == "Snowflake Table":
             except Exception as e:
                 st.error(f"Failed to load table: {e}")
         else:
-            st.warning("Please select a database, schema, and table first")
+            st.warning("Please set Database and Source Schema in the sidebar, then select a table")
 else:
     st.caption("Select a stage and pick an Excel/CSV file")
     meta_stage, meta_file = stage_file_picker(
@@ -672,7 +631,7 @@ else:
             except Exception as e:
                 st.error(f"Failed to load file: {e}")
         else:
-            st.warning("Please select a stage and file first")
+            st.warning("Please fill in Stage Database, Schema, Stage Name, and File Name")
 
 # Use whatever is in session state
 if st.session_state.collibra_metadata is not None:
