@@ -1,19 +1,54 @@
 import streamlit as st
 import pandas as pd
 import json
+import streamlit.components.v1 as components
 
 # NOTE: No st.set_page_config() here — only allowed in main app file
 
-# Hide navigation
-st.markdown("""
-<style>
-    [data-testid="stSidebarNav"] {
-        display: none;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Hide default sidebar nav — replaced by top step-indicator bar
+st.markdown('<style>[data-testid="stSidebarNav"]{display:none;}</style>', unsafe_allow_html=True)
+
+
+def _nav_to(page_file):
+    """Navigate to another page — works across all Streamlit versions."""
+    try:
+        st.switch_page(page_file)
+    except AttributeError:
+        slug = page_file.replace("pages/", "").replace(".py", "")
+        components.html(f"""<script>
+var links = window.parent.document.querySelectorAll('[data-testid="stSidebarNav"] a');
+for (var i = 0; i < links.length; i++) {{
+    if (links[i].href.toLowerCase().includes('{slug}')) {{
+        links[i].click();
+        break;
+    }}
+}}
+</script>""", height=0, width=0)
+
+
+def render_top_nav(current_page):
+    """Render a step-indicator navigation bar at the top."""
+    steps = [
+        ("📤", "Upload", "collibra_upload", "collibra_upload.py"),
+        ("✅", "Marketplace", "dq_marketplace", "pages/dq_marketplace.py"),
+        ("📊", "Review", "dq_review_page", "pages/dq_review_page.py"),
+    ]
+    cols = st.columns(len(steps))
+    for i, (icon, label, slug, file_path) in enumerate(steps):
+        with cols[i]:
+            btn_label = f"{icon} Step {i + 1}: {label}"
+            if slug == current_page:
+                st.button(btn_label, disabled=True, use_container_width=True,
+                          type="primary", key=f"topnav_{slug}")
+            else:
+                if st.button(btn_label, use_container_width=True,
+                             key=f"topnav_{slug}"):
+                    _nav_to(file_path)
+    st.markdown("---")
+
 
 st.title("✅ CDE Marketplace - Review & Customize Checks")
+render_top_nav("dq_marketplace")
 
 # ---------------------------------------------------------------------------
 # Auto-detect SiS vs Local
@@ -32,6 +67,23 @@ except Exception as e:
     else:
         st.error(f"Snowflake session error: {e}")
 
+def get_output_table(config_key: str) -> str:
+    """Build a fully-qualified output table name from session config."""
+    cfg = st.session_state.get("dq_config", {})
+    db = (cfg.get("OUTPUT_DATABASE") or "").strip()
+    schema = (cfg.get("OUTPUT_SCHEMA") or "").strip()
+    table = (cfg.get(config_key) or "").strip()
+    if not table:
+        defaults = {
+            "GENERATED_CHECKS_TABLE": "DQ_GENERATED_CHECKS",
+            "SELECTED_CHECKS_TABLE": "DQ_SELECTED_CHECKS",
+            "APPROVED_CHECKS_TABLE": "DQ_APPROVED_CHECKS",
+        }
+        table = defaults.get(config_key, config_key)
+    if db and schema:
+        return f"{db}.{schema}.{table}"
+    return table
+
 # Initialize session state
 if "selected_checks" not in st.session_state:
     st.session_state.selected_checks = {}
@@ -39,10 +91,14 @@ if "selected_checks" not in st.session_state:
 # Check for data
 if not st.session_state.get('connected', False):
     st.error("⚠️ Not connected. Please go back.")
+    if st.button("⬅️ Back to Upload Page"):
+        _nav_to("collibra_upload.py")
     st.stop()
 
 if st.session_state.get('df') is None:
     st.error("⚠️ No checks found. Please go back and generate checks first.")
+    if st.button("⬅️ Back to Upload Page"):
+        _nav_to("collibra_upload.py")
     st.stop()
 
 # Sidebar
@@ -53,7 +109,7 @@ with st.sidebar:
 
     if st.button("🔌 Reset Session"):
         st.session_state.clear()
-        st.experimental_rerun()
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +206,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # AI Quality Summary
 # ---------------------------------------------------------------------------
-if st.button("🤖 AI Quality Summary", key="ai_quality_summary", use_container_width=True):
+if st.button("🤖 AI Quality Summary", key="ai_quality_summary_btn", use_container_width=True):
     with st.spinner("Cortex AI is analyzing your checks..."):
         checks_info = []
         for _, row in df.iterrows():
@@ -189,14 +245,14 @@ Output only JSON, no markdown."""
         if response:
             try:
                 summary = parse_llm_json(response)
-                st.session_state.ai_quality_summary = summary
+                st.session_state.ai_quality_summary_data = summary
             except Exception as e:
                 st.error(f"Failed to parse summary: {e}")
                 with st.expander("Raw response"):
                     st.code(response)
 
-if st.session_state.get("ai_quality_summary"):
-    summary = st.session_state.ai_quality_summary
+if st.session_state.get("ai_quality_summary_data"):
+    summary = st.session_state.ai_quality_summary_data
     with st.expander("🤖 AI Quality Summary", expanded=True):
         qs_col1, qs_col2 = st.columns([1, 3])
         with qs_col1:
@@ -323,10 +379,11 @@ if selected_rows:
     final_yaml = "\n".join(yaml_lines)
 
     with col_btn1:
-        # Save to Snowflake table
+        _sel_table_fq = get_output_table("SELECTED_CHECKS_TABLE")
+        st.caption(f"Target: `{_sel_table_fq}`")
         if st.button("💾 Save to Snowflake Table", use_container_width=True):
-            if save_to_snowflake(selected_df, "DQ_SELECTED_CHECKS"):
-                st.success("✅ Saved to `DQ_SELECTED_CHECKS`")
+            if save_to_snowflake(selected_df, _sel_table_fq):
+                st.success(f"✅ Saved to `{_sel_table_fq}`")
 
     with col_btn2:
         # Download buttons for local, YAML preview for SiS
@@ -344,7 +401,8 @@ if selected_rows:
                 st.session_state['show_yaml_preview'] = True
 
     with col_btn3:
-        st.info("Navigate to **DQ Review** page in the sidebar →")
+        if st.button("➡️ Next: DQ Review", use_container_width=True, type="primary"):
+            _nav_to("pages/dq_review_page.py")
 
     # YAML preview / download
     if IS_LOCAL:
@@ -361,6 +419,6 @@ if selected_rows:
         st.code(final_yaml, language="yaml")
         if st.button("Close Preview"):
             st.session_state['show_yaml_preview'] = False
-            st.experimental_rerun()
+            st.rerun()
 else:
     st.warning("No checks selected")

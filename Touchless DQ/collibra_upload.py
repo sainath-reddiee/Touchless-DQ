@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 from typing import Optional
+import streamlit.components.v1 as components
 
 # App configuration — only in main file
 st.set_page_config(
@@ -12,16 +13,50 @@ st.set_page_config(
     layout="wide"
 )
 
-# Hide default navigation
-st.markdown("""
-<style>
-    [data-testid="stSidebarNav"] {
-        display: none;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Hide default sidebar nav — replaced by top step-indicator bar
+st.markdown('<style>[data-testid="stSidebarNav"]{display:none;}</style>', unsafe_allow_html=True)
+
+
+def _nav_to(page_file):
+    """Navigate to another page — works across all Streamlit versions."""
+    try:
+        st.switch_page(page_file)
+    except AttributeError:
+        slug = page_file.replace("pages/", "").replace(".py", "")
+        components.html(f"""<script>
+var links = window.parent.document.querySelectorAll('[data-testid="stSidebarNav"] a');
+for (var i = 0; i < links.length; i++) {{
+    if (links[i].href.toLowerCase().includes('{slug}')) {{
+        links[i].click();
+        break;
+    }}
+}}
+</script>""", height=0, width=0)
+
+
+def render_top_nav(current_page):
+    """Render a step-indicator navigation bar at the top."""
+    steps = [
+        ("📤", "Upload", "collibra_upload", "collibra_upload.py"),
+        ("✅", "Marketplace", "dq_marketplace", "pages/dq_marketplace.py"),
+        ("📊", "Review", "dq_review_page", "pages/dq_review_page.py"),
+    ]
+    cols = st.columns(len(steps))
+    for i, (icon, label, slug, file_path) in enumerate(steps):
+        with cols[i]:
+            btn_label = f"{icon} Step {i + 1}: {label}"
+            if slug == current_page:
+                st.button(btn_label, disabled=True, use_container_width=True,
+                          type="primary", key=f"topnav_{slug}")
+            else:
+                if st.button(btn_label, use_container_width=True,
+                             key=f"topnav_{slug}"):
+                    _nav_to(file_path)
+    st.markdown("---")
+
 
 st.title("📤 Upload Collibra Metadata & Catalog")
+render_top_nav("collibra_upload")
 
 # ---------------------------------------------------------------------------
 # Snowflake Session — auto-detect SiS vs local environment
@@ -125,6 +160,19 @@ if "metadata_context" not in st.session_state:
         "stage_prefix": ""
     }
 
+# Default output configuration — used until config is loaded from Snowflake
+_DEFAULT_DQ_CONFIG = {
+    "CONFIG_DATABASE": "",
+    "CONFIG_SCHEMA": "",
+    "OUTPUT_DATABASE": "",
+    "OUTPUT_SCHEMA": "",
+    "GENERATED_CHECKS_TABLE": "DQ_GENERATED_CHECKS",
+    "SELECTED_CHECKS_TABLE": "DQ_SELECTED_CHECKS",
+    "APPROVED_CHECKS_TABLE": "DQ_APPROVED_CHECKS",
+}
+if "dq_config" not in st.session_state:
+    st.session_state.dq_config = dict(_DEFAULT_DQ_CONFIG)
+
 # Pre-populate context from SiS session if available
 if session is not None:
     st.session_state.connected = True
@@ -141,6 +189,261 @@ if session is not None:
         except Exception:
             pass
         st.session_state.ctx_initialized = True
+
+
+# ===========================================================================
+# ALL HELPER FUNCTIONS — defined here so they are available to sidebar + UI
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helper — run SQL query and return DataFrame (works in both modes)
+# ---------------------------------------------------------------------------
+def run_query_df(query):
+    """Execute a SQL query and return results as a pandas DataFrame."""
+    if "_last_query_error" in st.session_state:
+        del st.session_state["_last_query_error"]
+    try:
+        if session is not None:
+            try:
+                df = session.sql(query).to_pandas()
+            except Exception:
+                rows = session.sql(query).collect()
+                if rows:
+                    cols = list(rows[0].asDict().keys())
+                    data = [list(r.asDict().values()) for r in rows]
+                    df = pd.DataFrame(data, columns=cols)
+                else:
+                    df = pd.DataFrame()
+        elif st.session_state.get("connection"):
+            cur = st.session_state.connection.cursor()
+            cur.execute(query)
+            columns = [desc[0] for desc in cur.description]
+            data = cur.fetchall()
+            cur.close()
+            df = pd.DataFrame(data, columns=columns)
+        else:
+            st.session_state["_last_query_error"] = "Not connected to Snowflake"
+            return pd.DataFrame()
+        if not df.empty:
+            df.columns = [c.lower().strip('"').strip("'") for c in df.columns]
+        return df
+    except Exception as e:
+        error_msg = str(e)
+        st.session_state["_last_query_error"] = error_msg
+        st.error(f"Query error: {error_msg}")
+        return pd.DataFrame()
+
+
+def get_cached_list(cache_key, query, column_name):
+    """Fetch and cache a list of values from a SQL query."""
+    if cache_key not in st.session_state:
+        df = run_query_df(query)
+        col = column_name.lower()
+        if col in df.columns:
+            st.session_state[cache_key] = sorted(
+                df[col].dropna().astype(str).unique().tolist()
+            )
+        elif len(df.columns) > 0:
+            st.session_state[cache_key] = sorted(
+                df.iloc[:, 0].dropna().astype(str).unique().tolist()
+            )
+        else:
+            st.session_state[cache_key] = []
+    return st.session_state[cache_key]
+
+
+def snowflake_table_picker(prefix):
+    """(Deprecated) Placeholder to maintain backwards compatibility."""
+    return None
+
+
+def call_llm(prompt, model_name):
+    """Call Snowflake Cortex LLM — supports both Snowpark session and connector."""
+    try:
+        escaped_prompt = prompt.replace("'", "''")
+        query = f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            '{model_name}',
+            '{escaped_prompt}'
+        ) AS response
+        """
+        if session is not None:
+            result = session.sql(query).collect()
+            return result[0]["RESPONSE"] if result else None
+        elif st.session_state.get("connection"):
+            cur = st.session_state.connection.cursor()
+            cur.execute(query)
+            result = cur.fetchone()
+            cur.close()
+            return result[0] if result else None
+        else:
+            st.error("Not connected to Snowflake.")
+            return None
+    except Exception as e:
+        st.error(f"LLM Error: {str(e)}")
+        return None
+
+
+def classify_columns(descriptions):
+    """Use SNOWFLAKE.CORTEX.CLASSIFY_TEXT to classify column descriptions."""
+    categories = ['PII', 'Financial', 'Geographic', 'Temporal',
+                  'Categorical', 'Identifier', 'Measurement', 'Text', 'Other']
+    categories_sql = ", ".join([f"'{c}'" for c in categories])
+    results = {}
+    for col_name, description in descriptions.items():
+        if not description or str(description).strip() == '':
+            results[col_name] = {"label": "Other", "score": 0.0}
+            continue
+        try:
+            escaped = str(description).replace("'", "''")
+            query = f"""
+            SELECT SNOWFLAKE.CORTEX.CLASSIFY_TEXT(
+                '{escaped}',
+                ARRAY_CONSTRUCT({categories_sql})
+            ) AS classification
+            """
+            if session is not None:
+                result = session.sql(query).collect()
+                raw = result[0]["CLASSIFICATION"] if result else "{}"
+            elif st.session_state.get("connection"):
+                cur = st.session_state.connection.cursor()
+                cur.execute(query)
+                result = cur.fetchone()
+                cur.close()
+                raw = result[0] if result else "{}"
+            else:
+                raw = "{}"
+            if isinstance(raw, str):
+                parsed = json.loads(raw)
+            else:
+                parsed = raw
+            results[col_name] = parsed
+        except Exception:
+            results[col_name] = {"label": "Other", "score": 0.0}
+    return results
+
+
+def parse_llm_json(raw):
+    """Best-effort extraction of a JSON object from a raw LLM response."""
+    cleaned = raw.strip()
+    if '```' in cleaned:
+        parts = cleaned.split('```')
+        if len(parts) >= 3:
+            cleaned = parts[1].replace('json', '', 1)
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start != -1 and end != -1:
+        cleaned = cleaned[start:end + 1]
+    return json.loads(cleaned)
+
+
+def save_to_snowflake(df, table_name):
+    """Save a pandas DataFrame to a Snowflake table.
+
+    If table_name is fully-qualified (DB.SCHEMA.TABLE), the session's
+    database/schema context is set first so Snowpark can create its
+    internal temp stage (required by create_dataframe).
+    """
+    try:
+        parts = table_name.split(".")
+        if session is not None:
+            # Snowpark needs a current DB/schema for temp stage operations.
+            # Set context from the fully-qualified name if provided.
+            if len(parts) == 3:
+                session.sql(f"USE DATABASE {parts[0]}").collect()
+                session.sql(f"USE SCHEMA {parts[0]}.{parts[1]}").collect()
+            snowpark_df = session.create_dataframe(df)
+            snowpark_df.write.mode("overwrite").save_as_table(table_name)
+        elif st.session_state.get("connection"):
+            from snowflake.connector.pandas_tools import write_pandas
+            conn = st.session_state.connection
+            # Set context for connector too
+            if len(parts) == 3:
+                cur = conn.cursor()
+                cur.execute(f"USE DATABASE {parts[0]}")
+                cur.execute(f"USE SCHEMA {parts[0]}.{parts[1]}")
+                cur.close()
+            write_pandas(
+                conn,
+                df,
+                table_name,
+                auto_create_table=True,
+                overwrite=True
+            )
+        else:
+            st.error("Not connected to Snowflake.")
+            return False
+        return True
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+        return False
+
+
+def _config_table_fq() -> str:
+    """Return the fully-qualified config table name from current settings."""
+    cfg = st.session_state.dq_config
+    db = (cfg.get("CONFIG_DATABASE") or "").strip()
+    schema = (cfg.get("CONFIG_SCHEMA") or "").strip()
+    if db and schema:
+        return f"{db}.{schema}.DQ_APP_CONFIG"
+    return "DQ_APP_CONFIG"
+
+
+def load_dq_config():
+    """Read DQ_APP_CONFIG from Snowflake and populate session state."""
+    fq = _config_table_fq()
+    try:
+        df = run_query_df(f"SELECT * FROM {fq}")
+        if df.empty:
+            return False
+        key_col = "config_key" if "config_key" in df.columns else df.columns[0]
+        val_col = "config_value" if "config_value" in df.columns else df.columns[1]
+        for _, row in df.iterrows():
+            k = str(row[key_col]).strip()
+            v = str(row[val_col]).strip() if row[val_col] is not None else ""
+            if k in st.session_state.dq_config:
+                st.session_state.dq_config[k] = v
+        return True
+    except Exception:
+        return False
+
+
+def save_dq_config():
+    """Write current dq_config to the DQ_APP_CONFIG table in Snowflake."""
+    fq = _config_table_fq()
+    rows = []
+    for k, v in st.session_state.dq_config.items():
+        rows.append({"CONFIG_KEY": k, "CONFIG_VALUE": v})
+    cfg_df = pd.DataFrame(rows)
+    return save_to_snowflake(cfg_df, fq)
+
+
+def get_output_table(config_key: str) -> str:
+    """Build a fully-qualified output table name from config."""
+    cfg = st.session_state.dq_config
+    db = (cfg.get("OUTPUT_DATABASE") or "").strip()
+    schema = (cfg.get("OUTPUT_SCHEMA") or "").strip()
+    table = (cfg.get(config_key) or "").strip()
+    if not table:
+        table = _DEFAULT_DQ_CONFIG.get(config_key, config_key)
+    if db and schema:
+        return f"{db}.{schema}.{table}"
+    return table
+
+
+def load_table(table_name):
+    """Load a Snowflake table as a pandas DataFrame."""
+    if session is not None:
+        return session.table(table_name).to_pandas()
+    elif st.session_state.get("connection"):
+        cur = st.session_state.connection.cursor()
+        cur.execute(f"SELECT * FROM {table_name}")
+        columns = [desc[0] for desc in cur.description]
+        data = cur.fetchall()
+        cur.close()
+        return pd.DataFrame(data, columns=columns)
+    else:
+        raise Exception("Not connected to Snowflake.")
 
 
 # ---------------------------------------------------------------------------
@@ -259,217 +562,81 @@ with st.sidebar:
     st.session_state.model = model
 
     st.divider()
+
+    # ---- Output Configuration (reads/writes DQ_APP_CONFIG) ----
+    st.header("⚙️ Output Config")
+    cfg = st.session_state.dq_config
+
+    cfg["CONFIG_DATABASE"] = st.text_input(
+        "Config DB",
+        value=cfg.get("CONFIG_DATABASE") or st.session_state.get("sf_database", ""),
+        key="cfg_config_db",
+        help="Database where DQ_APP_CONFIG table lives"
+    )
+    cfg["CONFIG_SCHEMA"] = st.text_input(
+        "Config Schema",
+        value=cfg.get("CONFIG_SCHEMA") or st.session_state.get("sf_schema", ""),
+        key="cfg_config_schema",
+        help="Schema where DQ_APP_CONFIG table lives"
+    )
+
+    cfg_load_col, cfg_save_col = st.columns(2)
+    with cfg_load_col:
+        if st.button("📥 Load", key="cfg_load_btn", use_container_width=True,
+                      help="Load config from DQ_APP_CONFIG table"):
+            ok = load_dq_config()
+            if ok:
+                st.success("Config loaded!")
+                st.rerun()
+            else:
+                st.warning("No config table found — using defaults. Click Save to create it.")
+    with cfg_save_col:
+        if st.button("💾 Save", key="cfg_save_btn", use_container_width=True,
+                      help="Save config to DQ_APP_CONFIG table"):
+            if save_dq_config():
+                st.success("Config saved!")
+            else:
+                st.error("Save failed — check permissions.")
+
+    with st.expander("📋 Output Table Settings", expanded=False):
+        cfg["OUTPUT_DATABASE"] = st.text_input(
+            "Output Database",
+            value=cfg.get("OUTPUT_DATABASE") or st.session_state.get("sf_database", ""),
+            key="cfg_output_db",
+            help="Database for all output tables"
+        )
+        cfg["OUTPUT_SCHEMA"] = st.text_input(
+            "Output Schema",
+            value=cfg.get("OUTPUT_SCHEMA") or st.session_state.get("sf_schema", ""),
+            key="cfg_output_schema",
+            help="Schema for all output tables"
+        )
+        cfg["GENERATED_CHECKS_TABLE"] = st.text_input(
+            "Generated Checks Table",
+            value=cfg.get("GENERATED_CHECKS_TABLE", "DQ_GENERATED_CHECKS"),
+            key="cfg_gen_table",
+        )
+        cfg["SELECTED_CHECKS_TABLE"] = st.text_input(
+            "Selected Checks Table",
+            value=cfg.get("SELECTED_CHECKS_TABLE", "DQ_SELECTED_CHECKS"),
+            key="cfg_sel_table",
+        )
+        cfg["APPROVED_CHECKS_TABLE"] = st.text_input(
+            "Approved Checks Table",
+            value=cfg.get("APPROVED_CHECKS_TABLE", "DQ_APPROVED_CHECKS"),
+            key="cfg_appr_table",
+        )
+        # Show resolved fully-qualified names
+        st.caption("**Resolved table names:**")
+        st.code(
+            f"{get_output_table('GENERATED_CHECKS_TABLE')}\n"
+            f"{get_output_table('SELECTED_CHECKS_TABLE')}\n"
+            f"{get_output_table('APPROVED_CHECKS_TABLE')}",
+            language="text"
+        )
+
+    st.divider()
     st.caption(f"ℹ️ Mode: {'Local Dev' if IS_LOCAL else 'Snowflake Streamlit'}")
-
-
-# ---------------------------------------------------------------------------
-# Helper — run SQL query and return DataFrame (works in both modes)
-# ---------------------------------------------------------------------------
-def run_query_df(query):
-    """Execute a SQL query and return results as a pandas DataFrame."""
-    # Clear previous errors
-    if "_last_query_error" in st.session_state:
-        del st.session_state["_last_query_error"]
-    
-    try:
-        if session is not None:
-            # SiS: try to_pandas() first, fall back to collect()
-            try:
-                df = session.sql(query).to_pandas()
-            except Exception:
-                # Fallback: use collect() and build DataFrame manually
-                rows = session.sql(query).collect()
-                if rows:
-                    cols = list(rows[0].asDict().keys())
-                    data = [list(r.asDict().values()) for r in rows]
-                    df = pd.DataFrame(data, columns=cols)
-                else:
-                    df = pd.DataFrame()
-        elif st.session_state.get("connection"):
-            cur = st.session_state.connection.cursor()
-            cur.execute(query)
-            columns = [desc[0] for desc in cur.description]
-            data = cur.fetchall()
-            cur.close()
-            df = pd.DataFrame(data, columns=columns)
-        else:
-            st.session_state["_last_query_error"] = "Not connected to Snowflake"
-            return pd.DataFrame()
-        # Normalize column names to lowercase and strip quotes
-        if not df.empty:
-            df.columns = [c.lower().strip('"').strip("'") for c in df.columns]
-        return df
-    except Exception as e:
-        error_msg = str(e)
-        st.session_state["_last_query_error"] = error_msg
-        st.error(f"Query error: {error_msg}")
-        return pd.DataFrame()
-
-
-def get_cached_list(cache_key, query, column_name):
-    """Fetch and cache a list of values from a SQL query."""
-    if cache_key not in st.session_state:
-        df = run_query_df(query)
-        col = column_name.lower()
-        if col in df.columns:
-            st.session_state[cache_key] = sorted(
-                df[col].dropna().astype(str).unique().tolist()
-            )
-        elif len(df.columns) > 0:
-            # Fallback: use the first column if exact name not found
-            st.session_state[cache_key] = sorted(
-                df.iloc[:, 0].dropna().astype(str).unique().tolist()
-            )
-        else:
-            st.session_state[cache_key] = []
-    return st.session_state[cache_key]
-
-
-# ---------------------------------------------------------------------------
-# Helper — Table picker (uses sidebar Database + Schema context)
-# ---------------------------------------------------------------------------
-def snowflake_table_picker(prefix):
-    """(Deprecated) Placeholder to maintain backwards compatibility."""
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Helper — call Snowflake Cortex LLM (works in both modes)
-# ---------------------------------------------------------------------------
-def call_llm(prompt, model_name):
-    """Call Snowflake Cortex LLM — supports both Snowpark session and connector."""
-    try:
-        escaped_prompt = prompt.replace("'", "''")
-        query = f"""
-        SELECT SNOWFLAKE.CORTEX.COMPLETE(
-            '{model_name}',
-            '{escaped_prompt}'
-        ) AS response
-        """
-
-        if session is not None:
-            # SiS: use Snowpark session
-            result = session.sql(query).collect()
-            return result[0]["RESPONSE"] if result else None
-        elif st.session_state.get("connection"):
-            # Local: use connector cursor
-            cur = st.session_state.connection.cursor()
-            cur.execute(query)
-            result = cur.fetchone()
-            cur.close()
-            return result[0] if result else None
-        else:
-            st.error("Not connected to Snowflake.")
-            return None
-    except Exception as e:
-        st.error(f"LLM Error: {str(e)}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Helper — call Cortex CLASSIFY_TEXT (column classification)
-# ---------------------------------------------------------------------------
-def classify_columns(descriptions):
-    """Use SNOWFLAKE.CORTEX.CLASSIFY_TEXT to classify column descriptions."""
-    categories = ['PII', 'Financial', 'Geographic', 'Temporal',
-                  'Categorical', 'Identifier', 'Measurement', 'Text', 'Other']
-    categories_sql = ", ".join([f"'{c}'" for c in categories])
-
-    results = {}
-    for col_name, description in descriptions.items():
-        if not description or str(description).strip() == '':
-            results[col_name] = {"label": "Other", "score": 0.0}
-            continue
-        try:
-            escaped = str(description).replace("'", "''")
-            query = f"""
-            SELECT SNOWFLAKE.CORTEX.CLASSIFY_TEXT(
-                '{escaped}',
-                ARRAY_CONSTRUCT({categories_sql})
-            ) AS classification
-            """
-            if session is not None:
-                result = session.sql(query).collect()
-                raw = result[0]["CLASSIFICATION"] if result else "{}"
-            elif st.session_state.get("connection"):
-                cur = st.session_state.connection.cursor()
-                cur.execute(query)
-                result = cur.fetchone()
-                cur.close()
-                raw = result[0] if result else "{}"
-            else:
-                raw = "{}"
-
-            if isinstance(raw, str):
-                parsed = json.loads(raw)
-            else:
-                parsed = raw
-            results[col_name] = parsed
-        except Exception:
-            results[col_name] = {"label": "Other", "score": 0.0}
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Helper — parse JSON from LLM response (handles markdown fences)
-# ---------------------------------------------------------------------------
-def parse_llm_json(raw):
-    """Best-effort extraction of a JSON object from a raw LLM response."""
-    cleaned = raw.strip()
-    if '```' in cleaned:
-        parts = cleaned.split('```')
-        if len(parts) >= 3:
-            cleaned = parts[1].replace('json', '', 1)
-    start = cleaned.find('{')
-    end = cleaned.rfind('}')
-    if start != -1 and end != -1:
-        cleaned = cleaned[start:end + 1]
-    return json.loads(cleaned)
-
-
-# ---------------------------------------------------------------------------
-# Helper — save dataframe to Snowflake (works in both modes)
-# ---------------------------------------------------------------------------
-def save_to_snowflake(df, table_name):
-    """Save a pandas DataFrame to a Snowflake table."""
-    try:
-        if session is not None:
-            snowpark_df = session.create_dataframe(df)
-            snowpark_df.write.mode("overwrite").save_as_table(table_name)
-        elif st.session_state.get("connection"):
-            from snowflake.connector.pandas_tools import write_pandas
-            write_pandas(
-                st.session_state.connection,
-                df,
-                table_name,
-                auto_create_table=True,
-                overwrite=True
-            )
-        else:
-            st.error("Not connected to Snowflake.")
-            return False
-        return True
-    except Exception as e:
-        st.error(f"Save failed: {e}")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Helper — load table (works in both modes)
-# ---------------------------------------------------------------------------
-def load_table(table_name):
-    """Load a Snowflake table as a pandas DataFrame."""
-    if session is not None:
-        return session.table(table_name).to_pandas()
-    elif st.session_state.get("connection"):
-        cur = st.session_state.connection.cursor()
-        cur.execute(f"SELECT * FROM {table_name}")
-        columns = [desc[0] for desc in cur.description]
-        data = cur.fetchall()
-        cur.close()
-        return pd.DataFrame(data, columns=columns)
-    else:
-        raise Exception("Not connected to Snowflake.")
 
 
 # Expected column names for catalog and metadata DataFrames.
@@ -1002,14 +1169,110 @@ metadata_context["schema"] = meta_schema_col.text_input(
 )
 metadata_source = st.radio(
     "Choose metadata source",
-    ["Snowflake Table", "Snowflake Stage (Excel/CSV)"],
+    ["Snowflake Data Table", "Snowflake Metadata Table", "Snowflake Stage (Excel/CSV)"],
     horizontal=True,
     key="metadata_source",
-    help="Load metadata from a Snowflake table or from an Excel/CSV file on a stage"
+    help=("**Data Table**: select a table and auto-generate column metadata from INFORMATION_SCHEMA. "
+          "**Metadata Table**: load a pre-existing metadata table with Column name/description columns. "
+          "**Stage**: load metadata from an Excel/CSV file on a stage.")
 )
 
 metadata_df = None
-if metadata_source == "Snowflake Table":
+if metadata_source == "Snowflake Data Table":
+    # ---- DATA TABLE PATH: auto-generate metadata from INFORMATION_SCHEMA ----
+    data_table_entries = list_tables_for_context(metadata_context, "data_table")
+    selected_data_table = ""
+    dt_select_col, dt_refresh_col = st.columns([7, 1])
+    with dt_select_col:
+        if data_table_entries:
+            option_values = [entry["value"] for entry in data_table_entries]
+            label_map = {entry["value"]: entry["label"] for entry in data_table_entries}
+            selected_data_table = st.selectbox(
+                "Choose data table",
+                [""] + option_values,
+                key="data_table_select",
+                format_func=lambda val: label_map.get(val, "Select table..." if val == "" else val)
+            )
+        else:
+            st.info("No tables found for the provided context.")
+    with dt_refresh_col:
+        st.write("\u200b")
+        if st.button("🔄", key="data_tables_refresh", help="Refresh table list"):
+            keys_to_clear = [k for k in list(st.session_state.keys())
+                             if k.startswith("_tables_data_table_") or k.startswith("_tables_debug_data_table")]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.rerun()
+
+    data_table_manual = st.text_input(
+        "Or enter table name",
+        value=st.session_state.get("data_table_name", ""),
+        placeholder="MY_DATA_TABLE",
+        key="data_table_name_input"
+    )
+
+    if st.button("📥 Generate Metadata from Table", key="load_data_table_btn", type="primary"):
+        try:
+            table_choice = data_table_manual.strip() or selected_data_table.strip()
+            if not table_choice:
+                raise ValueError("Select or enter a data table name.")
+            fq_table = resolve_table_name(table_choice, metadata_context)
+            parts = fq_table.split(".")
+            if len(parts) != 3:
+                raise ValueError(f"Need fully-qualified name (DB.SCHEMA.TABLE), got: {fq_table}")
+            info_query = f"""
+                SELECT
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    COMMENT,
+                    IS_NULLABLE,
+                    CHARACTER_MAXIMUM_LENGTH,
+                    NUMERIC_PRECISION,
+                    NUMERIC_SCALE
+                FROM {parts[0]}.INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = '{parts[1]}'
+                  AND TABLE_NAME   = '{parts[2]}'
+                ORDER BY ORDINAL_POSITION
+            """
+            info_df = run_query_df(info_query)
+            if info_df.empty:
+                raise ValueError(f"No columns found for {fq_table}. Check the table exists and you have access.")
+
+            # Build metadata DataFrame in the expected format
+            rows = []
+            for _, r in info_df.iterrows():
+                col_name = r.get("column_name", "")
+                dtype = r.get("data_type", "")
+                comment = r.get("comment", "") or ""
+                nullable = r.get("is_nullable", "")
+                char_len = r.get("character_maximum_length", "")
+                num_prec = r.get("numeric_precision", "")
+                num_scale = r.get("numeric_scale", "")
+                # Build a type detail string
+                type_detail = dtype
+                if char_len and str(char_len) not in ("", "None"):
+                    type_detail += f"({char_len})"
+                elif num_prec and str(num_prec) not in ("", "None"):
+                    scale_part = f",{num_scale}" if num_scale and str(num_scale) not in ("", "None") else ""
+                    type_detail += f"({num_prec}{scale_part})"
+                related = f"Nullable: {nullable}"
+                rows.append({
+                    'Column name': col_name,
+                    'Column description': comment if comment else f"Column {col_name} ({type_detail})",
+                    'Datatype': type_detail,
+                    'Related Fields (Min/Max/Sample Values)': related,
+                })
+            metadata_df = pd.DataFrame(rows)
+            st.session_state.collibra_metadata = metadata_df
+            st.session_state.data_table_name = table_choice
+            st.session_state.data_table_fq = fq_table
+            st.success(f"✅ Metadata auto-generated: **{len(metadata_df)}** columns from `{fq_table}`")
+        except ValueError as ve:
+            st.error(str(ve))
+        except Exception as e:
+            st.error(f"Failed to generate metadata: {e}")
+
+elif metadata_source == "Snowflake Metadata Table":
     metadata_table_entries = list_tables_for_context(metadata_context, "metadata")
     selected_metadata_table = ""
     meta_select_col, meta_refresh_col = st.columns([7, 1])
@@ -1079,7 +1342,7 @@ if metadata_source == "Snowflake Table":
             st.error(str(ve))
         except Exception as e:
             st.error(f"Failed to load table: {e}")
-else:
+elif metadata_source == "Snowflake Stage (Excel/CSV)":
     # ---- STAGE PATH (dynamic stage dropdown) ----
     stage_entries = list_stages_for_context(metadata_context, "metadata")
     meta_stage_select_col, meta_stage_refresh_col = st.columns([7, 1])
@@ -1485,9 +1748,11 @@ if st.session_state.generated_checks is not None:
     with col2:
         st.metric("CDEs Matched", generated_df['Critical Data Element'].nunique())
     with col3:
+        _gen_table_fq = get_output_table("GENERATED_CHECKS_TABLE")
+        st.caption(f"Target: `{_gen_table_fq}`")
         if st.button("💾 Save to Snowflake", key="save_checks_btn", use_container_width=True):
-            if save_to_snowflake(generated_df, "DQ_GENERATED_CHECKS"):
-                st.success("✅ Saved to table `DQ_GENERATED_CHECKS`")
+            if save_to_snowflake(generated_df, _gen_table_fq):
+                st.success(f"✅ Saved to `{_gen_table_fq}`")
     with col4:
         if st.button("📈 AI Coverage Assessment", key="ai_coverage_btn", use_container_width=True):
             with st.spinner("Cortex AI is assessing DQ coverage..."):
@@ -1597,4 +1862,4 @@ Output only JSON, no markdown."""
         st.write("")
         st.write("")
         if st.button("➡️ Next: Marketplace", type="primary", use_container_width=True):
-            st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
+            _nav_to("pages/dq_marketplace.py")

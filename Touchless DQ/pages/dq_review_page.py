@@ -1,19 +1,54 @@
 import streamlit as st
 import pandas as pd
 import json
+import streamlit.components.v1 as components
 
 # NOTE: No st.set_page_config() here — only allowed in main app file
 
-# Hide default navigation
-st.markdown("""
-<style>
-    [data-testid="stSidebarNav"] {
-        display: none;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Hide default sidebar nav — replaced by top step-indicator bar
+st.markdown('<style>[data-testid="stSidebarNav"]{display:none;}</style>', unsafe_allow_html=True)
+
+
+def _nav_to(page_file):
+    """Navigate to another page — works across all Streamlit versions."""
+    try:
+        st.switch_page(page_file)
+    except AttributeError:
+        slug = page_file.replace("pages/", "").replace(".py", "")
+        components.html(f"""<script>
+var links = window.parent.document.querySelectorAll('[data-testid="stSidebarNav"] a');
+for (var i = 0; i < links.length; i++) {{
+    if (links[i].href.toLowerCase().includes('{slug}')) {{
+        links[i].click();
+        break;
+    }}
+}}
+</script>""", height=0, width=0)
+
+
+def render_top_nav(current_page):
+    """Render a step-indicator navigation bar at the top."""
+    steps = [
+        ("📤", "Upload", "collibra_upload", "collibra_upload.py"),
+        ("✅", "Marketplace", "dq_marketplace", "pages/dq_marketplace.py"),
+        ("📊", "Review", "dq_review_page", "pages/dq_review_page.py"),
+    ]
+    cols = st.columns(len(steps))
+    for i, (icon, label, slug, file_path) in enumerate(steps):
+        with cols[i]:
+            btn_label = f"{icon} Step {i + 1}: {label}"
+            if slug == current_page:
+                st.button(btn_label, disabled=True, use_container_width=True,
+                          type="primary", key=f"topnav_{slug}")
+            else:
+                if st.button(btn_label, use_container_width=True,
+                             key=f"topnav_{slug}"):
+                    _nav_to(file_path)
+    st.markdown("---")
+
 
 st.title("📊 Review & Approve Data Quality Checks")
+render_top_nav("dq_review_page")
 
 # ---------------------------------------------------------------------------
 # Auto-detect SiS vs Local
@@ -32,6 +67,51 @@ except Exception as e:
     else:
         st.error(f"Snowflake session error: {e}")
 
+
+def get_output_table(config_key: str) -> str:
+    """Build a fully-qualified output table name from session config."""
+    cfg = st.session_state.get("dq_config", {})
+    db = (cfg.get("OUTPUT_DATABASE") or "").strip()
+    schema = (cfg.get("OUTPUT_SCHEMA") or "").strip()
+    table = (cfg.get(config_key) or "").strip()
+    if not table:
+        defaults = {
+            "GENERATED_CHECKS_TABLE": "DQ_GENERATED_CHECKS",
+            "SELECTED_CHECKS_TABLE": "DQ_SELECTED_CHECKS",
+            "APPROVED_CHECKS_TABLE": "DQ_APPROVED_CHECKS",
+        }
+        table = defaults.get(config_key, config_key)
+    if db and schema:
+        return f"{db}.{schema}.{table}"
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Helper — call Cortex LLM (dual-mode)
+# ---------------------------------------------------------------------------
+def call_cortex(prompt: str, model_name: str):
+    """Call Snowflake Cortex — supports both Snowpark session and connector."""
+    escaped_prompt = prompt.replace("'", "''")
+    query = f"""
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(
+        '{model_name}',
+        '{escaped_prompt}'
+    ) AS response
+    """
+    if session is not None:
+        result = session.sql(query).collect()
+        return result[0]["RESPONSE"] if result else None
+    elif st.session_state.get("connection"):
+        cur = st.session_state.connection.cursor()
+        cur.execute(query)
+        result = cur.fetchone()
+        cur.close()
+        return result[0] if result else None
+    else:
+        st.error("Not connected to Snowflake.")
+        return None
+
+
 # Initialize session state
 if "current_check_index" not in st.session_state:
     st.session_state.current_check_index = 0
@@ -39,7 +119,8 @@ if "current_check_index" not in st.session_state:
 # Check if we have checks from marketplace
 if not st.session_state.get('selected_checks'):
     st.error("⚠️ No checks found! Please go back to the marketplace and select some checks first.")
-    st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
+    if st.button("⬅️ Back to Marketplace"):
+        _nav_to("pages/dq_marketplace.py")
     st.stop()
 
 # Build list of selected checks
@@ -53,7 +134,8 @@ for check_key, check_data in st.session_state.selected_checks.items():
 
 if not all_checks:
     st.warning("No checks selected. Please go back to the marketplace and select some checks.")
-    st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
+    if st.button("⬅️ Back to Marketplace", key="nav_back_mp_empty"):
+        _nav_to("pages/dq_marketplace.py")
     st.stop()
 
 # Sidebar navigation
@@ -75,12 +157,12 @@ with st.sidebar:
             type="primary" if is_current else "secondary"
         ):
             st.session_state.current_check_index = idx
-            st.experimental_rerun()
+            st.rerun()
 
     st.divider()
 
     if st.button("⬅️ Back to Marketplace", use_container_width=True):
-        st.info("👈 Navigate to **DQ Marketplace** in the sidebar")
+        _nav_to("pages/dq_marketplace.py")
 
 # Progress indicator
 st.progress((st.session_state.current_check_index + 1) / len(all_checks))
@@ -233,7 +315,7 @@ Keep it concise (3-5 sentences per point)."""
             st.session_state.selected_checks[current_check['key']]['row']['SODACL Yaml Check Definition'] = \
                 st.session_state[f'ai_improved_{st.session_state.current_check_index}']
             del st.session_state[f'ai_improved_{st.session_state.current_check_index}']
-            st.experimental_rerun()
+            st.rerun()
 
     # Show AI explanation
     if st.session_state.get(f'ai_explanation_{st.session_state.current_check_index}'):
@@ -248,12 +330,12 @@ col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 with col1:
     if st.button("⬅️ Previous", use_container_width=True, disabled=st.session_state.current_check_index == 0):
         st.session_state.current_check_index -= 1
-        st.experimental_rerun()
+        st.rerun()
 
 with col2:
     if st.button("➡️ Next", use_container_width=True, disabled=st.session_state.current_check_index >= len(all_checks) - 1):
         st.session_state.current_check_index += 1
-        st.experimental_rerun()
+        st.rerun()
 
 with col3:
     if st.button("🧪 Test Check", use_container_width=True, type="secondary"):
@@ -264,36 +346,12 @@ with col4:
         st.success(f"✅ Approved: {current_row['Check name']}")
         if st.session_state.current_check_index < len(all_checks) - 1:
             st.session_state.current_check_index += 1
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.balloons()
             st.info("🎉 All checks reviewed!")
 
 
-# ---------------------------------------------------------------------------
-# Helper — call Cortex LLM (dual-mode)
-# ---------------------------------------------------------------------------
-def call_cortex(prompt: str, model_name: str):
-    """Call Snowflake Cortex — supports both Snowpark session and connector."""
-    escaped_prompt = prompt.replace("'", "''")
-    query = f"""
-    SELECT SNOWFLAKE.CORTEX.COMPLETE(
-        '{model_name}',
-        '{escaped_prompt}'
-    ) AS response
-    """
-    if session is not None:
-        result = session.sql(query).collect()
-        return result[0]["RESPONSE"] if result else None
-    elif st.session_state.get("connection"):
-        cur = st.session_state.connection.cursor()
-        cur.execute(query)
-        result = cur.fetchone()
-        cur.close()
-        return result[0] if result else None
-    else:
-        st.error("Not connected to Snowflake.")
-        return None
 
 
 # ===========================================================================
@@ -379,7 +437,7 @@ if st.session_state.get(f'show_test_{st.session_state.current_check_index}', Fal
                 key=f"close_test_{st.session_state.current_check_index}"
             ):
                 st.session_state[f'show_test_{st.session_state.current_check_index}'] = False
-                st.experimental_rerun()
+                st.rerun()
 
     with col_test_right:
         st.markdown("**Test Results:**")
@@ -515,11 +573,25 @@ if selected_rows:
                 use_container_width=True
             )
         else:
+            _appr_table_fq = get_output_table("APPROVED_CHECKS_TABLE")
+            st.caption(f"Target: `{_appr_table_fq}`")
             if st.button("💾 Save Approved Checks to Snowflake", use_container_width=True):
                 try:
-                    snowpark_df = session.create_dataframe(selected_df)
-                    snowpark_df.write.mode("overwrite").save_as_table("DQ_APPROVED_CHECKS")
-                    st.success("✅ Saved to table `DQ_APPROVED_CHECKS`")
+                    if session is not None:
+                        snowpark_df = session.create_dataframe(selected_df)
+                        snowpark_df.write.mode("overwrite").save_as_table(_appr_table_fq)
+                    elif st.session_state.get("connection"):
+                        from snowflake.connector.pandas_tools import write_pandas
+                        write_pandas(
+                            st.session_state.connection,
+                            selected_df,
+                            _appr_table_fq,
+                            auto_create_table=True,
+                            overwrite=True
+                        )
+                    else:
+                        st.error("Not connected to Snowflake.")
+                    st.success(f"✅ Saved to `{_appr_table_fq}`")
                 except Exception as e:
                     st.error(f"Save failed: {e}")
 
@@ -542,6 +614,6 @@ if selected_rows:
         st.code(final_yaml, language="yaml")
         if st.button("Close YAML Preview"):
             st.session_state['show_final_yaml'] = False
-            st.experimental_rerun()
+            st.rerun()
 else:
     st.warning("No checks selected")
