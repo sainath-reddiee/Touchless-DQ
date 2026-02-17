@@ -109,7 +109,7 @@ with st.sidebar:
 
     if st.button("🔌 Reset Session"):
         st.session_state.clear()
-        st.rerun()
+        st.experimental_rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +419,6 @@ if selected_rows:
         st.code(final_yaml, language="yaml")
         if st.button("Close Preview"):
             st.session_state['show_yaml_preview'] = False
-            st.rerun()
+            st.experimental_rerun()
 else:
     st.warning("No checks selected")

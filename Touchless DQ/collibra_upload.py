@@ -522,7 +522,7 @@ with st.sidebar:
                         conn = get_local_connection()
                         st.session_state.connection = conn
                         st.session_state.connected = True
-                        st.rerun()
+                        st.experimental_rerun()
                 except Exception as e:
                     st.error(f"Connection failed: {e}")
     else:
@@ -549,7 +549,7 @@ with st.sidebar:
                 except Exception:
                     pass
                 st.session_state.clear()
-                st.rerun()
+                st.experimental_rerun()
 
     st.divider()
 
@@ -587,7 +587,7 @@ with st.sidebar:
             ok = load_dq_config()
             if ok:
                 st.success("Config loaded!")
-                st.rerun()
+                st.experimental_rerun()
             else:
                 st.warning("No config table found — using defaults. Click Save to create it.")
     with cfg_save_col:
@@ -656,15 +656,70 @@ def _normalize_df_columns(df: pd.DataFrame, expected: list) -> pd.DataFrame:
     """Map DataFrame columns to expected names via case-insensitive match.
 
     Handles variations like underscores vs spaces
-    (e.g., CRITICAL_DATA_ELEMENT -> Critical Data Element).
+    (e.g., CRITICAL_DATA_ELEMENT -> Critical Data Element) and common
+    typos (e.g., DOMIAN -> Domain, CHCK -> Check).
     """
     col_map = {}
-    # Normalize key: lowercase, underscores to spaces, strip
+    expected_set = set(expected)
+    # Primary lookup: normalized expected name -> canonical name
     lower_lookup = {e.lower().replace('_', ' ').strip(): e for e in expected}
+    # Track which expected columns have already been matched
+    matched_expected = set()
+
     for actual in df.columns:
+        if actual in expected_set:
+            matched_expected.add(actual)
+            continue  # already matches exactly
         key = actual.lower().replace('_', ' ').strip()
-        if key in lower_lookup and actual != lower_lookup[key]:
+        if key in lower_lookup:
             col_map[actual] = lower_lookup[key]
+            matched_expected.add(lower_lookup[key])
+
+    # Fuzzy fallback for remaining unmatched columns — handles typos
+    # like DOMIAN->Domain, SODACL_YAML_CHCK_DEFINITION->SODACL Yaml Check Definition
+    unmatched_expected = [e for e in expected if e not in matched_expected
+                         and e not in col_map.values()]
+    if unmatched_expected:
+        unmatched_actual = [c for c in df.columns
+                           if c not in col_map and c not in expected_set]
+        for exp in unmatched_expected:
+            exp_key = exp.lower().replace('_', ' ').strip()
+            exp_words = set(exp_key.split())
+            best_match = None
+            best_score = 0
+            for act in unmatched_actual:
+                act_key = act.lower().replace('_', ' ').strip()
+                act_words = set(act_key.split())
+                # Calculate word-overlap score
+                common = exp_words & act_words
+                if common:
+                    score = len(common) / max(len(exp_words), len(act_words))
+                    if score > best_score:
+                        best_score = score
+                        best_match = act
+                # Also check if one contains most of the other (typo-tolerant)
+                elif len(exp_words) == 1 and len(act_words) == 1:
+                    # Single-word columns: check edit-distance-like similarity
+                    e_w = exp_key
+                    a_w = act_key
+                    # Check if one is a substring of the other or nearly so
+                    shorter, longer = (e_w, a_w) if len(e_w) <= len(a_w) else (a_w, e_w)
+                    if len(shorter) >= 3 and shorter in longer:
+                        score = len(shorter) / len(longer)
+                        if score > best_score:
+                            best_score = score
+                            best_match = act
+                    # Also check character overlap for typos like domian/domain
+                    elif len(shorter) >= 3:
+                        common_chars = sum(1 for c in shorter if c in longer)
+                        ratio = common_chars / max(len(shorter), len(longer))
+                        if ratio >= 0.75 and ratio > best_score:
+                            best_score = ratio
+                            best_match = act
+            if best_match and best_score >= 0.5:
+                col_map[best_match] = exp
+                unmatched_actual.remove(best_match)
+
     if col_map:
         df = df.rename(columns=col_map)
     return df
@@ -978,7 +1033,7 @@ if catalog_source == "Snowflake Table":
                              if k.startswith("_tables_catalog_") or k.startswith("_tables_debug_catalog")]
             for k in keys_to_clear:
                 del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     # Debug expander for table listing failures
     debug_info = st.session_state.get("_tables_debug_catalog")
@@ -1042,7 +1097,7 @@ else:
                              if k.startswith("_stages_catalog_") or k.startswith("_stages_debug_catalog")]
             for k in keys_to_clear:
                 del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     # Debug expander for stage listing failures
     stages_debug = st.session_state.get("_stages_debug_catalog")
@@ -1202,7 +1257,7 @@ if metadata_source == "Snowflake Data Table":
                              if k.startswith("_tables_data_table_") or k.startswith("_tables_debug_data_table")]
             for k in keys_to_clear:
                 del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     data_table_manual = st.text_input(
         "Or enter table name",
@@ -1294,7 +1349,7 @@ elif metadata_source == "Snowflake Metadata Table":
             keys_to_clear = [k for k in list(st.session_state.keys()) if k.startswith("_tables_metadata_") or k.startswith("_tables_debug_metadata")]
             for k in keys_to_clear:
                 del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     debug_info = st.session_state.get("_tables_debug_metadata")
     if debug_info and debug_info.get("status") in ["empty", "error"]:
@@ -1367,7 +1422,7 @@ elif metadata_source == "Snowflake Stage (Excel/CSV)":
                              if k.startswith("_stages_metadata_") or k.startswith("_stages_debug_metadata")]
             for k in keys_to_clear:
                 del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     # Debug expander for stage listing failures
     stages_debug = st.session_state.get("_stages_debug_metadata")
@@ -1724,7 +1779,7 @@ Output only JSON, no markdown."""
 
                         st.session_state.synthetic_values = synthetic_values
                         st.success(f"✅ Generated synthetic test values for {len(synthetic_values)} columns!")
-                        st.rerun()
+                        st.experimental_rerun()
                     else:
                         st.warning("No matches found")
 
