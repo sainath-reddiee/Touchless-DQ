@@ -340,36 +340,64 @@ def parse_llm_json(raw):
 def save_to_snowflake(df, table_name):
     """Save a pandas DataFrame to a Snowflake table.
 
-    If table_name is fully-qualified (DB.SCHEMA.TABLE), the session's
-    database/schema context is set first so Snowpark can create its
-    internal temp stage (required by create_dataframe).
+    Uses fully-qualified table names throughout to avoid unsupported
+    USE DATABASE / USE SCHEMA commands in SiS environments.
     """
     try:
         parts = table_name.split(".")
         if session is not None:
-            # Snowpark needs a current DB/schema for temp stage operations.
-            # Set context from the fully-qualified name if provided.
-            if len(parts) == 3:
-                session.sql(f"USE DATABASE {parts[0]}").collect()
-                session.sql(f"USE SCHEMA {parts[0]}.{parts[1]}").collect()
-            snowpark_df = session.create_dataframe(df)
-            snowpark_df.write.mode("overwrite").save_as_table(table_name)
+            # In SiS, USE statements are not allowed.  Use write_pandas
+            # from the underlying connection which accepts FQ names directly.
+            try:
+                from snowflake.connector.pandas_tools import write_pandas
+                raw_conn = session.connection   # underlying connector
+                if len(parts) == 3:
+                    write_pandas(
+                        raw_conn,
+                        df,
+                        parts[2],
+                        database=parts[0],
+                        schema=parts[1],
+                        auto_create_table=True,
+                        overwrite=True,
+                        quote_identifiers=False,
+                    )
+                else:
+                    write_pandas(
+                        raw_conn,
+                        df,
+                        table_name,
+                        auto_create_table=True,
+                        overwrite=True,
+                        quote_identifiers=False,
+                    )
+            except AttributeError:
+                # Fallback: session.connection not available — use Snowpark
+                snowpark_df = session.create_dataframe(df)
+                snowpark_df.write.mode("overwrite").save_as_table(table_name)
         elif st.session_state.get("connection"):
             from snowflake.connector.pandas_tools import write_pandas
             conn = st.session_state.connection
-            # Set context for connector too
             if len(parts) == 3:
-                cur = conn.cursor()
-                cur.execute(f"USE DATABASE {parts[0]}")
-                cur.execute(f"USE SCHEMA {parts[0]}.{parts[1]}")
-                cur.close()
-            write_pandas(
-                conn,
-                df,
-                table_name,
-                auto_create_table=True,
-                overwrite=True
-            )
+                write_pandas(
+                    conn,
+                    df,
+                    parts[2],
+                    database=parts[0],
+                    schema=parts[1],
+                    auto_create_table=True,
+                    overwrite=True,
+                    quote_identifiers=False,
+                )
+            else:
+                write_pandas(
+                    conn,
+                    df,
+                    table_name,
+                    auto_create_table=True,
+                    overwrite=True,
+                    quote_identifiers=False,
+                )
         else:
             st.error("Not connected to Snowflake.")
             return False
