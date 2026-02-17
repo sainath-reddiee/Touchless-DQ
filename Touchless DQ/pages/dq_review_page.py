@@ -577,18 +577,38 @@ if selected_rows:
             st.caption(f"Target: `{_appr_table_fq}`")
             if st.button("💾 Save Approved Checks to Snowflake", use_container_width=True):
                 try:
+                    # Sanitise column names for Snowflake compatibility
+                    _save_df = selected_df.copy()
+                    _save_df.columns = [
+                        c.strip().replace(' ', '_').replace('(', '').replace(')', '')
+                         .replace('/', '_').upper()
+                        for c in _save_df.columns
+                    ]
+                    _parts = _appr_table_fq.split(".")
                     if session is not None:
-                        snowpark_df = session.create_dataframe(selected_df)
-                        snowpark_df.write.mode("overwrite").save_as_table(_appr_table_fq)
+                        try:
+                            from snowflake.connector.pandas_tools import write_pandas
+                            _raw = session.connection
+                            if len(_parts) == 3:
+                                write_pandas(_raw, _save_df, _parts[2],
+                                             database=_parts[0], schema=_parts[1],
+                                             auto_create_table=True, overwrite=True)
+                            else:
+                                write_pandas(_raw, _save_df, _appr_table_fq,
+                                             auto_create_table=True, overwrite=True)
+                        except AttributeError:
+                            snowpark_df = session.create_dataframe(_save_df)
+                            snowpark_df.write.mode("overwrite").save_as_table(_appr_table_fq)
                     elif st.session_state.get("connection"):
                         from snowflake.connector.pandas_tools import write_pandas
-                        write_pandas(
-                            st.session_state.connection,
-                            selected_df,
-                            _appr_table_fq,
-                            auto_create_table=True,
-                            overwrite=True
-                        )
+                        _conn = st.session_state.connection
+                        if len(_parts) == 3:
+                            write_pandas(_conn, _save_df, _parts[2],
+                                         database=_parts[0], schema=_parts[1],
+                                         auto_create_table=True, overwrite=True)
+                        else:
+                            write_pandas(_conn, _save_df, _appr_table_fq,
+                                         auto_create_table=True, overwrite=True)
                     else:
                         st.error("Not connected to Snowflake.")
                     st.success(f"✅ Saved to `{_appr_table_fq}`")

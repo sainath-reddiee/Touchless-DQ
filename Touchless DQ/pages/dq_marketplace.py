@@ -118,18 +118,39 @@ with st.sidebar:
 def save_to_snowflake(df: pd.DataFrame, table_name: str):
     """Save a pandas DataFrame to a Snowflake table."""
     try:
+        # Sanitise column names for Snowflake compatibility
+        save_df = df.copy()
+        save_df.columns = [
+            c.strip().replace(' ', '_').replace('(', '').replace(')', '')
+             .replace('/', '_').upper()
+            for c in save_df.columns
+        ]
+
+        parts = table_name.split(".")
         if session is not None:
-            snowpark_df = session.create_dataframe(df)
-            snowpark_df.write.mode("overwrite").save_as_table(table_name)
+            try:
+                from snowflake.connector.pandas_tools import write_pandas
+                raw_conn = session.connection
+                if len(parts) == 3:
+                    write_pandas(raw_conn, save_df, parts[2],
+                                 database=parts[0], schema=parts[1],
+                                 auto_create_table=True, overwrite=True)
+                else:
+                    write_pandas(raw_conn, save_df, table_name,
+                                 auto_create_table=True, overwrite=True)
+            except AttributeError:
+                snowpark_df = session.create_dataframe(save_df)
+                snowpark_df.write.mode("overwrite").save_as_table(table_name)
         elif st.session_state.get("connection"):
             from snowflake.connector.pandas_tools import write_pandas
-            write_pandas(
-                st.session_state.connection,
-                df,
-                table_name,
-                auto_create_table=True,
-                overwrite=True
-            )
+            conn = st.session_state.connection
+            if len(parts) == 3:
+                write_pandas(conn, save_df, parts[2],
+                             database=parts[0], schema=parts[1],
+                             auto_create_table=True, overwrite=True)
+            else:
+                write_pandas(conn, save_df, table_name,
+                             auto_create_table=True, overwrite=True)
         else:
             st.error("Not connected to Snowflake.")
             return False

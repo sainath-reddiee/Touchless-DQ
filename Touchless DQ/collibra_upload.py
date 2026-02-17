@@ -342,8 +342,18 @@ def save_to_snowflake(df, table_name):
 
     Uses fully-qualified table names throughout to avoid unsupported
     USE DATABASE / USE SCHEMA commands in SiS environments.
+    Column names are sanitised (spaces -> underscores, uppercased) to
+    avoid quoting issues in Snowflake SQL.
     """
     try:
+        # Sanitise column names: replace spaces with underscores, uppercase
+        save_df = df.copy()
+        save_df.columns = [
+            c.strip().replace(' ', '_').replace('(', '').replace(')', '')
+             .replace('/', '_').upper()
+            for c in save_df.columns
+        ]
+
         parts = table_name.split(".")
         if session is not None:
             # In SiS, USE statements are not allowed.  Use write_pandas
@@ -354,26 +364,24 @@ def save_to_snowflake(df, table_name):
                 if len(parts) == 3:
                     write_pandas(
                         raw_conn,
-                        df,
+                        save_df,
                         parts[2],
                         database=parts[0],
                         schema=parts[1],
                         auto_create_table=True,
                         overwrite=True,
-                        quote_identifiers=False,
                     )
                 else:
                     write_pandas(
                         raw_conn,
-                        df,
+                        save_df,
                         table_name,
                         auto_create_table=True,
                         overwrite=True,
-                        quote_identifiers=False,
                     )
             except AttributeError:
                 # Fallback: session.connection not available — use Snowpark
-                snowpark_df = session.create_dataframe(df)
+                snowpark_df = session.create_dataframe(save_df)
                 snowpark_df.write.mode("overwrite").save_as_table(table_name)
         elif st.session_state.get("connection"):
             from snowflake.connector.pandas_tools import write_pandas
@@ -381,22 +389,20 @@ def save_to_snowflake(df, table_name):
             if len(parts) == 3:
                 write_pandas(
                     conn,
-                    df,
+                    save_df,
                     parts[2],
                     database=parts[0],
                     schema=parts[1],
                     auto_create_table=True,
                     overwrite=True,
-                    quote_identifiers=False,
                 )
             else:
                 write_pandas(
                     conn,
-                    df,
+                    save_df,
                     table_name,
                     auto_create_table=True,
                     overwrite=True,
-                    quote_identifiers=False,
                 )
         else:
             st.error("Not connected to Snowflake.")
