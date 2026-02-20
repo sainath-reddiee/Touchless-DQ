@@ -260,19 +260,27 @@ def snowflake_table_picker(prefix):
 def call_llm(prompt, model_name):
     """Call Snowflake Cortex LLM — supports both Snowpark session and connector."""
     try:
-        escaped_prompt = prompt.replace("'", "''")
-        query = f"""
-        SELECT SNOWFLAKE.CORTEX.COMPLETE(
-            '{model_name}',
-            '{escaped_prompt}'
-        ) AS response
-        """
         if session is not None:
+            # Snowpark: use $$ dollar-quoting to avoid escaping issues with large prompts
+            escaped_prompt = prompt.replace('$$', '$ $')
+            query = f"""
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                '{model_name}',
+                $${escaped_prompt}$$
+            ) AS response
+            """
             result = session.sql(query).collect()
             return result[0]["RESPONSE"] if result else None
         elif st.session_state.get("connection"):
+            # Connector: use parameterised query to handle special characters safely
+            query = """
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                %s,
+                %s
+            ) AS response
+            """
             cur = st.session_state.connection.cursor()
-            cur.execute(query)
+            cur.execute(query, (model_name, prompt))
             result = cur.fetchone()
             cur.close()
             return result[0] if result else None
@@ -324,7 +332,11 @@ def classify_columns(descriptions):
 
 
 def parse_llm_json(raw):
-    """Best-effort extraction of a JSON object from a raw LLM response."""
+    """Best-effort extraction of a JSON object from a raw LLM response.
+
+    Handles truncated JSON from large LLM responses by attempting to
+    repair unbalanced braces/brackets.
+    """
     cleaned = raw.strip()
     if '```' in cleaned:
         parts = cleaned.split('```')
@@ -334,7 +346,60 @@ def parse_llm_json(raw):
     end = cleaned.rfind('}')
     if start != -1 and end != -1:
         cleaned = cleaned[start:end + 1]
-    return json.loads(cleaned)
+    elif start != -1:
+        # Truncated response — no closing brace found; take from opening brace
+        cleaned = cleaned[start:]
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Attempt to repair truncated JSON by balancing braces/brackets
+        repaired = _repair_truncated_json(cleaned)
+        return json.loads(repaired)
+
+
+def _repair_truncated_json(text):
+    """Attempt to fix truncated JSON by closing open braces/brackets.
+
+    Strips any trailing incomplete key-value pair, then appends the
+    necessary closing characters.
+    """
+    # Remove trailing partial entries (e.g. a key without a value)
+    import re
+    text = re.sub(r',\s*"[^"]*"\s*:\s*$', '', text.rstrip())
+    text = re.sub(r',\s*\{[^}]*$', '', text.rstrip())
+    text = re.sub(r',\s*$', '', text.rstrip())
+
+    # Count unbalanced braces/brackets (ignoring those inside strings)
+    open_braces = 0
+    open_brackets = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            open_braces += 1
+        elif ch == '}':
+            open_braces -= 1
+        elif ch == '[':
+            open_brackets += 1
+        elif ch == ']':
+            open_brackets -= 1
+
+    # Append missing closers
+    text += ']' * max(open_brackets, 0)
+    text += '}' * max(open_braces, 0)
+    return text
 
 
 def save_to_snowflake(df, table_name):
@@ -1696,13 +1761,27 @@ if st.session_state.collibra_metadata is not None and st.session_state.catalog_d
                     'related_fields': str(row.get('Related Fields (Min/Max/Sample Values)', ''))
                 })
 
-            matching_prompt = f"""You are a data quality expert. Match Collibra metadata columns to catalog Critical Data Elements (CDEs).
+            # --- Batch metadata into chunks to avoid LLM token limits ---
+            MATCH_BATCH_SIZE = 50
+            all_match_results = []
+            total_batches = (len(metadata_info) + MATCH_BATCH_SIZE - 1) // MATCH_BATCH_SIZE
+            progress_bar = st.progress(0, text="Matching columns...")
+
+            for batch_idx in range(0, len(metadata_info), MATCH_BATCH_SIZE):
+                batch = metadata_info[batch_idx:batch_idx + MATCH_BATCH_SIZE]
+                batch_num = batch_idx // MATCH_BATCH_SIZE + 1
+                progress_bar.progress(
+                    batch_num / total_batches,
+                    text=f"Matching batch {batch_num}/{total_batches} ({len(batch)} columns)..."
+                )
+
+                matching_prompt = f"""You are a data quality expert. Match Collibra metadata columns to catalog Critical Data Elements (CDEs).
 
 Catalog Domains: {catalog_domains}
 Catalog CDEs: {catalog_cdes}
 
 Metadata Columns:
-{json.dumps(metadata_info, indent=2)}
+{json.dumps(batch, indent=2)}
 
 For each metadata column:
 1. Identify the best matching Domain from catalog
@@ -1724,21 +1803,31 @@ Respond ONLY with valid JSON:
 
 Output only JSON, no markdown."""
 
-            response = call_llm(matching_prompt, st.session_state.model)
+                response = call_llm(matching_prompt, st.session_state.model)
 
-            if response:
+                if response:
+                    try:
+                        batch_matches = parse_llm_json(response)
+                        all_match_results.extend(batch_matches.get('matches', []))
+                    except Exception as e:
+                        st.warning(f"Batch {batch_num}/{total_batches} parse error: {e}. Skipping {len(batch)} columns.")
+                        with st.expander(f"Raw response (batch {batch_num})"):
+                            st.code(response)
+
+            progress_bar.empty()
+            matches = {"matches": all_match_results}
+
+            if all_match_results:
                 try:
-                    matches = parse_llm_json(response)
-
-                    st.success("✅ Matching complete!")
+                    st.success(f"✅ Matching complete! Matched {len(all_match_results)} columns.")
                     with st.expander("🔍 View Matches"):
                         st.json(matches)
 
                     # Build output rows
                     output_rows = []
                     for match in matches.get('matches', []):
-                        column_name = match['column_name']
-                        matched_cde = match['matched_cde']
+                        column_name = match.get('column_name', '')
+                        matched_cde = match.get('matched_cde', 'Unknown')
 
                         if matched_cde != "Unknown":
                             cde_checks = catalog_df[catalog_df['Critical Data Element'] == matched_cde]
@@ -1761,43 +1850,57 @@ Output only JSON, no markdown."""
 
                         st.success(f"✅ Generated {len(output_df)} checks!")
 
-                        # Generate synthetic test values
+                        # Generate synthetic test values in batches
                         st.info("🧪 Generating synthetic test values...")
                         synthetic_values = {}
                         unique_cdes = output_df['Critical Data Element'].unique()
+                        SYNTH_BATCH_SIZE = 10
+                        synth_progress = st.progress(0, text="Generating synthetic values...")
 
-                        for cde in unique_cdes:
-                            cde_checks = output_df[output_df['Critical Data Element'] == cde]
-                            first_check = cde_checks.iloc[0]
+                        for synth_batch_idx in range(0, len(unique_cdes), SYNTH_BATCH_SIZE):
+                            synth_batch = unique_cdes[synth_batch_idx:synth_batch_idx + SYNTH_BATCH_SIZE]
+                            synth_batch_num = synth_batch_idx // SYNTH_BATCH_SIZE + 1
+                            synth_total_batches = (len(unique_cdes) + SYNTH_BATCH_SIZE - 1) // SYNTH_BATCH_SIZE
+                            synth_progress.progress(
+                                synth_batch_num / synth_total_batches,
+                                text=f"Generating synthetic values (batch {synth_batch_num}/{synth_total_batches})..."
+                            )
 
-                            original_metadata = None
-                            for _, meta_row in metadata_df.iterrows():
-                                if meta_row.get('Column name', '') == cde:
-                                    original_metadata = meta_row
-                                    break
+                            # Build batch prompt with multiple columns
+                            columns_info = []
+                            for cde in synth_batch:
+                                cde_checks = output_df[output_df['Critical Data Element'] == cde]
+                                first_check = cde_checks.iloc[0]
+                                original_metadata = None
+                                for _, meta_row in metadata_df.iterrows():
+                                    if meta_row.get('Column name', '') == cde:
+                                        original_metadata = meta_row
+                                        break
+                                columns_info.append({
+                                    'column': cde,
+                                    'description': first_check['Short description of Critical Data Element'],
+                                    'domain': first_check['Domain'],
+                                    'datatype': original_metadata.get('Datatype', '') if original_metadata is not None else '',
+                                    'related_fields': str(original_metadata.get('Related Fields (Min/Max/Sample Values)', '')) if original_metadata is not None else ''
+                                })
 
-                            synthetic_prompt = f"""Generate synthetic test values for data quality testing.
+                            synthetic_prompt = f"""Generate synthetic test values for data quality testing for these columns.
 
-Column: {cde}
-Description: {first_check['Short description of Critical Data Element']}
-Domain: {first_check['Domain']}
+Columns:
+{json.dumps(columns_info, indent=2)}
 
-Metadata:
-{json.dumps({
-    'datatype': original_metadata.get('Datatype', '') if original_metadata is not None else '',
-    'related_fields': str(original_metadata.get('Related Fields (Min/Max/Sample Values)', '')) if original_metadata is not None else ''
-}, indent=2)}
-
-Generate 10 synthetic values that include:
-- 6 VALID values (should pass checks)
-- 4 INVALID values (should fail checks - edge cases, out of range, wrong format, nulls)
+For EACH column, generate 10 synthetic values: 6 VALID (pass checks) and 4 INVALID (fail - edge cases, wrong format, nulls).
 
 Respond ONLY with valid JSON:
 {{
-  "values": [
-    {{"value": "32.95", "expected": "PASS", "reason": "Valid latitude"}},
-    {{"value": "-91.5", "expected": "FAIL", "reason": "Out of range"}}
-  ]
+  "columns": {{
+    "COLUMN_NAME": {{
+      "values": [
+        {{"value": "32.95", "expected": "PASS", "reason": "Valid value"}},
+        {{"value": "-91.5", "expected": "FAIL", "reason": "Out of range"}}
+      ]
+    }}
+  }}
 }}
 
 Output only JSON, no markdown."""
@@ -1807,10 +1910,17 @@ Output only JSON, no markdown."""
                             if synth_response:
                                 try:
                                     synth_data = parse_llm_json(synth_response)
-                                    synthetic_values[cde] = synth_data.get('values', [])
+                                    columns_data = synth_data.get('columns', {})
+                                    for cde in synth_batch:
+                                        if cde in columns_data:
+                                            synthetic_values[cde] = columns_data[cde].get('values', [])
+                                        else:
+                                            synthetic_values[cde] = []
                                 except Exception:
-                                    synthetic_values[cde] = []
+                                    for cde in synth_batch:
+                                        synthetic_values[cde] = []
 
+                        synth_progress.empty()
                         st.session_state.synthetic_values = synthetic_values
                         st.success(f"✅ Generated synthetic test values for {len(synthetic_values)} columns!")
                         st.experimental_rerun()
@@ -1818,9 +1928,9 @@ Output only JSON, no markdown."""
                         st.warning("No matches found")
 
                 except Exception as e:
-                    st.error(f"Failed to parse: {str(e)}")
-                    with st.expander("Raw response"):
-                        st.code(response)
+                    st.error(f"Failed to parse matching results: {str(e)}")
+            else:
+                st.warning("No matches found. AI could not match any columns.")
 
 # ===========================================================================
 # Display results & export
@@ -1845,18 +1955,32 @@ if st.session_state.generated_checks is not None:
     with col4:
         if st.button("📈 AI Coverage Assessment", key="ai_coverage_btn", use_container_width=True):
             with st.spinner("Cortex AI is assessing DQ coverage..."):
+                # Summarise checks to keep the prompt compact for large tables
                 checks_summary = []
-                for _, row in generated_df.iterrows():
-                    checks_summary.append({
-                        "cde": row["Critical Data Element"],
-                        "domain": row["Domain"],
-                        "dimension": row["DQ Dimension"],
-                        "check": row["Check name"]
-                    })
+                if len(generated_df) > 200:
+                    # Aggregate: count checks per CDE per dimension
+                    agg = generated_df.groupby(
+                        ['Critical Data Element', 'Domain', 'DQ Dimension']
+                    ).size().reset_index(name='check_count')
+                    for _, row in agg.iterrows():
+                        checks_summary.append({
+                            "cde": row["Critical Data Element"],
+                            "domain": row["Domain"],
+                            "dimension": row["DQ Dimension"],
+                            "check_count": int(row["check_count"])
+                        })
+                else:
+                    for _, row in generated_df.iterrows():
+                        checks_summary.append({
+                            "cde": row["Critical Data Element"],
+                            "domain": row["Domain"],
+                            "dimension": row["DQ Dimension"],
+                            "check": row["Check name"]
+                        })
 
                 coverage_prompt = f"""You are a data quality expert. Assess the completeness and coverage of these generated DQ checks.
 
-Generated Checks:
+Generated Checks ({len(generated_df)} total across {generated_df['Critical Data Element'].nunique()} CDEs):
 {json.dumps(checks_summary, indent=2)}
 
 Standard DQ Dimensions: Completeness, Validity, Accuracy, Consistency, Timeliness, Uniqueness

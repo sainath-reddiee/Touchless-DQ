@@ -186,19 +186,25 @@ with col4:
 def call_cortex(prompt, model_name):
     """Call Snowflake Cortex — supports both Snowpark session and connector."""
     try:
-        escaped_prompt = prompt.replace("'", "''")
-        query = f"""
-        SELECT SNOWFLAKE.CORTEX.COMPLETE(
-            '{model_name}',
-            '{escaped_prompt}'
-        ) AS response
-        """
         if session is not None:
+            escaped_prompt = prompt.replace('$$', '$ $')
+            query = f"""
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                '{model_name}',
+                $${escaped_prompt}$$
+            ) AS response
+            """
             result = session.sql(query).collect()
             return result[0]["RESPONSE"] if result else None
         elif st.session_state.get("connection"):
+            query = """
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                %s,
+                %s
+            ) AS response
+            """
             cur = st.session_state.connection.cursor()
-            cur.execute(query)
+            cur.execute(query, (model_name, prompt))
             result = cur.fetchone()
             cur.close()
             return result[0] if result else None
@@ -208,6 +214,41 @@ def call_cortex(prompt, model_name):
     except Exception as e:
         st.error(f"LLM Error: {e}")
         return None
+
+def _repair_truncated_json(text):
+    """Attempt to fix truncated JSON by closing open braces/brackets."""
+    import re
+    text = re.sub(r',\s*"[^"]*"\s*:\s*$', '', text.rstrip())
+    text = re.sub(r',\s*\{[^}]*$', '', text.rstrip())
+    text = re.sub(r',\s*$', '', text.rstrip())
+    open_braces = 0
+    open_brackets = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            open_braces += 1
+        elif ch == '}':
+            open_braces -= 1
+        elif ch == '[':
+            open_brackets += 1
+        elif ch == ']':
+            open_brackets -= 1
+    text += ']' * max(open_brackets, 0)
+    text += '}' * max(open_braces, 0)
+    return text
+
 
 def parse_llm_json(raw):
     """Best-effort extraction of a JSON object from a raw LLM response."""
@@ -220,7 +261,13 @@ def parse_llm_json(raw):
     end = cleaned.rfind('}')
     if start != -1 and end != -1:
         cleaned = cleaned[start:end + 1]
-    return json.loads(cleaned)
+    elif start != -1:
+        cleaned = cleaned[start:]
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        repaired = _repair_truncated_json(cleaned)
+        return json.loads(repaired)
 
 st.divider()
 
@@ -229,19 +276,33 @@ st.divider()
 # ---------------------------------------------------------------------------
 if st.button("🤖 AI Quality Summary", key="ai_quality_summary_btn", use_container_width=True):
     with st.spinner("Cortex AI is analyzing your checks..."):
-        checks_info = []
-        for _, row in df.iterrows():
-            checks_info.append({
-                "cde": row["Critical Data Element"],
-                "domain": row["Domain"],
-                "dimension": row["DQ Dimension"],
-                "check_name": row["Check name"],
-                "description": row["Check Description"][:100]
-            })
+        # Summarise checks compactly for large datasets
+        if len(df) > 200:
+            agg = df.groupby(
+                ['Critical Data Element', 'Domain', 'DQ Dimension']
+            ).size().reset_index(name='check_count')
+            checks_info = []
+            for _, row in agg.iterrows():
+                checks_info.append({
+                    "cde": row["Critical Data Element"],
+                    "domain": row["Domain"],
+                    "dimension": row["DQ Dimension"],
+                    "check_count": int(row["check_count"])
+                })
+        else:
+            checks_info = []
+            for _, row in df.iterrows():
+                checks_info.append({
+                    "cde": row["Critical Data Element"],
+                    "domain": row["Domain"],
+                    "dimension": row["DQ Dimension"],
+                    "check_name": row["Check name"],
+                    "description": row["Check Description"][:100]
+                })
 
         summary_prompt = f"""You are a data quality expert. Provide a quality summary of these DQ checks.
 
-Checks:
+Checks ({len(df)} total across {df['Critical Data Element'].nunique()} CDEs):
 {json.dumps(checks_info, indent=2)}
 
 Analyze and provide:
